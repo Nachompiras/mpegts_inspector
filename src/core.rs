@@ -4,31 +4,17 @@ use std::{
     time::{Duration, Instant},
 };
 use serde::Serialize;
-use clap::Parser;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::{net::UdpSocket};
 
-mod psi;
-mod es;
-use psi::{parse_pat, parse_pmt, PatSection, PmtSection};
-use es::{parse_aac_adts, parse_h26x_sps};
 
-/// CLI
-#[derive(Parser, Debug)]
-struct Opt {
-    /// Multicast or unicast socket address to bind **and** listen to, e.g. 239.1.1.2:1234
-    #[clap(long, default_value_t = String::from("239.1.1.2:1234"))]
-    addr: String,
+use crate::psi::{parse_pat, parse_pmt, PatSection, PmtSection};
+use crate::es::{parse_aac_adts, parse_h26x_sps};
 
-    /// How often (in seconds) to print a report
-    #[clap(long, default_value_t = 2)]
-    refresh: u64,
-}
 
 #[tokio::main(flavor = "multi_thread")]
-async fn main() -> anyhow::Result<()> {
-    let opt = Opt::parse();
-    let socket = create_udp_socket(&opt.addr)?;
+pub async fn run(opts: crate::inspector::Options) -> anyhow::Result<()> {
+    let socket = create_udp_socket(&opts.addr.to_string())?;
     let sock = UdpSocket::from_std(socket.into())?;
 
     let mut buf = [0u8; 2048];
@@ -170,7 +156,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        if last_print.elapsed() >= Duration::from_secs(opt.refresh) {
+        if last_print.elapsed() >= Duration::from_secs(opts.refresh_secs) {
             // Limpia stats viejos antes de generar JSON
             es_stats.retain(|_, s| s.start.elapsed() < Duration::from_secs(30));
         
