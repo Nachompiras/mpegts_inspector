@@ -104,18 +104,6 @@ Report {
 
 *Fields marked `?` appear only when relevant.*
 
----
-
-## 🛠  Extending
-
-* **More codecs** – add a tiny parser in `src/es.rs`, list its `stream_type`
-  in `stream_type_name()` and you’re done.
-* **Prometheus / HTTP** – swap the `println!` that prints JSON for a Hyper /
-  Axum handler or a Prometheus exporter.
-* **PCR‑based bitrate** – replace byte‑count with PCR deltas for high‑precision
-  DVB measurements.
-
----
 
 ## 📜  License
 
