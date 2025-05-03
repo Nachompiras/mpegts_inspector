@@ -7,11 +7,16 @@ use serde::Serialize;
 /// 27 MHz clock: 27 000 000 ticks / second
 const PCR_CLOCK_HZ: f64 = 27_000_000.0;
 /// ±500 ns in PCR ticks  →  27 000 000 * 5e-7  ≈ 13.5
-const PCR_ACCURACY_TICKS: u64 = 14;
+const PCR_ACCURACY_TICKS: u64 = 27;
 /// Repetition threshold 40 ms
-const PCR_REPETITION_MS: u64 = 40;
+const PCR_REPETITION_MS: u64 = 100;
 
-const NULL_RATE_THRESHOLD: f64 = 0.10;          // 10 %
+const NULL_RATE_THRESHOLD: f64 = 0.15;          // 10 %
+const CAT_TIMEOUT_MS:  u64 = 2000;   // 2 s
+const NIT_TIMEOUT_MS:  u64 = 2000;   // 2 s
+const SDT_TIMEOUT_MS:  u64 = 2000;   // 2 s
+const EIT_TIMEOUT_MS:  u64 = 2000;   // 2 s
+const TDT_TIMEOUT_MS:  u64 = 2000;   // 2 s
 
 #[derive(Default, Debug, Clone,Serialize)]
 pub struct Tr101Metrics {
@@ -27,9 +32,9 @@ pub struct Tr101Metrics {
     /* ───────── Priority-2 (new) ───────── */
     pub pcr_repetition_errors:       u64, // 2.4
     pub pcr_accuracy_errors:         u64, // 2.5     
-     pub null_packet_rate_errors:    u64, // 2.6
-     pub cat_crc_errors:             u64, // 2.7a
-     pub cat_timeout:                u64, // 2.7b
+    pub null_packet_rate_errors:    u64, // 2.6
+    pub cat_crc_errors:             u64, // 2.7a
+    pub cat_timeout:                u64, // 2.7b
  
      /* Priority-3 */
      pub service_id_mismatch:        u64, // 3.2-d
@@ -221,20 +226,30 @@ impl Tr101Metrics {
         }
 
         /* ───── 1-s timeouts for CAT/NIT/… ───── */
-        if self.last_cat_seen.map_or(true, |t| t.elapsed() > Duration::from_secs(1)) {
-            self.cat_timeout += 1;  self.last_cat_seen = Some(now);
+        if self.last_cat_seen.map_or(true, |t| t.elapsed()
+                > Duration::from_millis(CAT_TIMEOUT_MS)) {
+            self.cat_timeout += 1;
+            self.last_cat_seen = Some(now);
         }
-        if self.last_nit_seen.map_or(true, |t| t.elapsed() > Duration::from_secs(1)) {
-            self.nit_timeout += 1;  self.last_nit_seen = Some(now);
+        if self.last_nit_seen.map_or(true, |t| t.elapsed()
+                > Duration::from_millis(NIT_TIMEOUT_MS)) {
+            self.nit_timeout += 1;
+            self.last_nit_seen = Some(now);
         }
-        if self.last_sdt_seen.map_or(true, |t| t.elapsed() > Duration::from_secs(1)) {
-            self.sdt_timeout += 1;  self.last_sdt_seen = Some(now);
+        if self.last_sdt_seen.map_or(true, |t| t.elapsed()
+                > Duration::from_millis(SDT_TIMEOUT_MS)) {
+            self.sdt_timeout += 1;
+            self.last_sdt_seen = Some(now);
         }
-        if self.last_eit_seen.map_or(true, |t| t.elapsed() > Duration::from_secs(1)) {
-            self.eit_timeout += 1;  self.last_eit_seen = Some(now);
+        if self.last_eit_seen.map_or(true, |t| t.elapsed()
+                > Duration::from_millis(EIT_TIMEOUT_MS)) {
+            self.eit_timeout += 1;
+            self.last_eit_seen = Some(now);
         }
-        if self.last_tdt_seen.map_or(true, |t| t.elapsed() > Duration::from_secs(1)) {
-            self.tdt_timeout += 1;  self.last_tdt_seen = Some(now);
+        if self.last_tdt_seen.map_or(true, |t| t.elapsed()
+                > Duration::from_millis(TDT_TIMEOUT_MS)) {
+            self.tdt_timeout += 1;
+            self.last_tdt_seen = Some(now);
         }
     }
 }
