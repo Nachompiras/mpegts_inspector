@@ -7,16 +7,14 @@ use serde::Serialize;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::{net::UdpSocket};
 
+use crate::{es::{parse_aac_adts, parse_h26x_sps}, psi::{parse_cat, parse_eit_pf, parse_nit, parse_pat, parse_pmt, parse_sdt, PatSection, PmtSection}, si_cache};
+use crate::tr101;
 
-use crate::psi::{parse_pat, parse_pmt, PatSection, PmtSection};
-use crate::es::{parse_aac_adts, parse_h26x_sps};
-
-
-#[tokio::main(flavor = "multi_thread")]
 pub async fn run(opts: crate::inspector::Options) -> anyhow::Result<()> {
     let socket = create_udp_socket(&opts.addr.to_string())?;
     let sock = UdpSocket::from_std(socket.into())?;
-
+    let mut si_cache = si_cache::SiCache::default();
+    let mut tr101 = if true { Some(tr101::Tr101Metrics::new()) } else { None };
     let mut buf = [0u8; 2048];
     let mut pat_map = HashMap::<u16, PatSection>::new(); // program_number -> PAT info
     let mut pmt_map = HashMap::<u16, PmtSection>::new(); // pmt_pid -> parsed PMT
@@ -35,14 +33,14 @@ pub async fn run(opts: crate::inspector::Options) -> anyhow::Result<()> {
             if chunk[0] != 0x47 {
                 continue; // bad sync
             }
-            process_ts_packet(chunk, &mut pat_map, &mut pmt_map, &mut es_stats);
+            process_ts_packet(chunk, &mut pat_map, &mut pmt_map, &mut es_stats, &mut si_cache, tr101.as_mut());
         }
 
         if last_print.elapsed() >= Duration::from_secs(opts.refresh_secs) {
             // Limpia stats viejos antes de generar JSON
             es_stats.retain(|_, s| s.start.elapsed() < Duration::from_secs(30));
         
-            let json = report_json(&pat_map, &pmt_map, &es_stats);
+            let json = report_json(&pat_map, &pmt_map, &es_stats, tr101.as_ref().unwrap_or(&tr101::Tr101Metrics::default()));
             println!("{json}");
             last_print = Instant::now();
         }
@@ -55,9 +53,11 @@ pub async fn run(opts: crate::inspector::Options) -> anyhow::Result<()> {
 pub async fn run_broadcast(
     rx: &mut tokio::sync::broadcast::Receiver<Vec<u8>>,
     refresh_secs: u64,
+    analysis: bool, 
 ) -> anyhow::Result<()> {
-    use tokio::time::Instant;
 
+    let mut si_cache = si_cache::SiCache::default();
+    let mut tr101 = if analysis { Some(tr101::Tr101Metrics::new()) } else { None };
     let mut pat_map = HashMap::<u16, PatSection>::new();
     let mut pmt_map = HashMap::<u16, PmtSection>::new();
     let mut es_stats = HashMap::<u16, EsStats>::new();
@@ -67,12 +67,12 @@ pub async fn run_broadcast(
         let buf = rx.recv().await?;          // waits for next TS chunk
         for chunk in buf.chunks_exact(188) {
             if chunk[0] != 0x47 { continue; }
-            process_ts_packet(chunk, &mut pat_map, &mut pmt_map, &mut es_stats);
+            process_ts_packet(chunk, &mut pat_map, &mut pmt_map, &mut es_stats, &mut si_cache,tr101.as_mut());
         }
 
         if last_print.elapsed() >= Duration::from_secs(refresh_secs) {
             es_stats.retain(|_, s| s.start.elapsed() < Duration::from_secs(30));
-            let json = report_json(&pat_map, &pmt_map, &es_stats);
+            let json = report_json(&pat_map, &pmt_map, &es_stats, tr101.as_ref().unwrap_or(&tr101::Tr101Metrics::default()));
             println!("{json}");
             last_print = Instant::now();
         }
@@ -161,6 +161,7 @@ struct ProgramJson<'a> {
 struct ReportJson<'a> {
     ts_time: String,
     programs: Vec<ProgramJson<'a>>,
+    tr101:    &'a tr101::Tr101Metrics, 
 }
 
 fn print_report(
@@ -210,6 +211,7 @@ fn report_json<'a>(
     pat_map: &'a HashMap<u16, PatSection>,
     pmt_map: &'a HashMap<u16, PmtSection>,
     es_stats: &'a HashMap<u16, EsStats>,
+    tr101:     &'a tr101::Tr101Metrics,
 ) -> String {
     let mut programs_out = Vec::new();
 
@@ -266,6 +268,7 @@ fn report_json<'a>(
     let rep = ReportJson {
         ts_time: chrono::Utc::now().to_rfc3339(),
         programs: programs_out,
+        tr101: tr101,
     };
     serde_json::to_string_pretty(&rep).unwrap()
 }
@@ -275,11 +278,21 @@ fn process_ts_packet(
     pat_map: &mut HashMap<u16, PatSection>,
     pmt_map: &mut HashMap<u16, PmtSection>,
     es_stats: &mut HashMap<u16, EsStats>,
+    si_cache:  &mut si_cache::SiCache,         
+    tr101: Option<&mut tr101::Tr101Metrics>,
 ) {
     let pid = ((chunk[1] & 0x1F) as u16) << 8 | chunk[2] as u16;
     let payload_unit_start = chunk[1] & 0x40 != 0;
     let adaption_field_ctrl = (chunk[3] & 0x30) >> 4;
     let mut payload_offset = 4usize;
+    let mut pat_crc_ok: Option<bool> = None;
+    let mut pmt_crc_ok: Option<bool> = None;
+    let mut cat_crc_ok: Option<bool> = None;
+    let mut nit_crc_ok: Option<bool> = None;
+    let mut sdt_crc_ok: Option<bool> = None;
+    let mut eit_crc_ok: Option<bool> = None;
+    let mut table_id: u8 = 0xFF; 
+
     if adaption_field_ctrl == 2 || adaption_field_ctrl == 0 {
         return;
     }
@@ -290,13 +303,59 @@ fn process_ts_packet(
             return;
         }
     }
+
+    let mut pcr_found: Option<(u64,u16)> = None;
+    if adaption_field_ctrl & 0x02 != 0 && payload_offset > 4 {
+        /* adaptation field starts at chunk[4] */
+        let ad_len = chunk[4] as usize;
+        if ad_len >= 7 && chunk[5] & 0x10 != 0 { // PCR_flag
+            let p = &chunk[6..12];
+            let base = ((p[0] as u64) << 25)
+                    | ((p[1] as u64) << 17)
+                    | ((p[2] as u64) << 9)
+                    | ((p[3] as u64) << 1)
+                    | ((p[4] as u64) >> 7);
+            let ext  = ((p[4] & 0x01) as u16) << 8 | p[5] as u16;
+            pcr_found = Some((base, ext));
+        }
+    }
+
     let payload = &chunk[payload_offset..];
 
     // PAT
     if pid == 0x0000 && payload_unit_start {
-        if let Ok(pat) = parse_pat(payload) {
-            for entry in &pat.programs {
-                pat_map.insert(entry.program_number, pat.clone());
+        match parse_pat(payload) {
+            Ok(pat) => { 
+                pat_crc_ok = Some(true); 
+                si_cache.update_pat(pat.clone());
+                for entry in &pat.programs {
+                    pat_map.insert(entry.program_number, pat.clone());
+                }
+            }
+            Err(_)  => { pat_crc_ok = Some(false); }
+        }        
+    }
+    //CAT
+    if pid == 0x0001 && payload_unit_start {
+        match parse_cat(payload) {
+            Ok((_table_id, _cat)) => {
+                cat_crc_ok = Some(true);
+                table_id   = _table_id;
+            }
+            Err(_) => { cat_crc_ok = Some(false); }
+        }
+    }
+
+    // ── NIT  (PID 0x0010) ───────────────────────────────────────────
+    if pid == 0x0010 && payload_unit_start {
+        match parse_nit(payload) {
+            Ok((tid, nit)) => {
+                nit_crc_ok = Some(true);      // CRC passed
+                table_id   = tid;             // 0x40 or 0x41
+                si_cache.update_nit(nit);     // store for semantic checks
+            }
+            Err(_) => {
+                nit_crc_ok = Some(false);     // CRC fail or malformed
             }
         }
     }
@@ -306,8 +365,37 @@ fn process_ts_packet(
         pat_map.iter().find(|(_, p)| p.programs.iter().any(|e| e.pmt_pid == pid))
     {
         if payload_unit_start {
-            if let Ok(pmt) = parse_pmt(payload) {
-                pmt_map.insert(pid, pmt);
+            match parse_pmt(payload) {
+                Ok(pmt) => { 
+                    pmt_crc_ok = Some(true); 
+                    si_cache.update_pmt(pid, pmt.clone());
+                    pmt_map.insert(pid, pmt.clone());
+                }
+                Err(_)  => { pmt_crc_ok = Some(false); }
+            }            
+        }
+    }
+
+    // ── SDT arrived (PID 0x0011) ───────────────────────────────
+    if pid == 0x0011 && payload_unit_start {
+        let mut handled = false;
+        if sdt_crc_ok.is_none() {             // only parse if not already detected
+            if let Ok((tid, sdt)) = crate::psi::parse_sdt(payload) {
+                sdt_crc_ok = Some(true);
+                table_id   = tid;             // 0x42 / 0x46
+                si_cache.update_sdt(sdt);
+                handled = true;
+            }
+        }
+    
+        // if not SDT, try EIT present/following
+        if !handled {
+            match parse_eit_pf(payload) {
+                Ok((tid, _eit)) => {
+                    eit_crc_ok = Some(true);
+                    table_id   = tid;         // 0x4E / 0x4F
+                }
+                Err(_) => { /* may be TOT/TDT or CRC error → ignore */ }
             }
         }
     }
@@ -388,6 +476,51 @@ fn process_ts_packet(
                 },
             );
         }
+    }
+     /* … inside the function … */
+     if let Some(metrics) = tr101 {
+
+        if si_cache.check_service_id_mismatch() {
+            metrics.service_id_mismatch += 1;
+        }
+
+         /* ───── 3.5 splice_countdown ───── */
+         if adaption_field_ctrl & 0x02 != 0 && payload_offset > 4 {
+            let ad_len = chunk[4] as usize;
+            if ad_len >= 1 {
+                let flags = chunk[5];
+                if flags & 0x04 != 0 {
+                    // splice_countdown present
+                    let sc_pos = 6 + ad_len - 1;           // last byte in AF
+                    let val = chunk[sc_pos] as i8;
+                    match metrics.last_splice_value {
+                        None => metrics.last_splice_value = Some(val),
+                        Some(prev) => {
+                            // legal: same value, decrement by 1, or wrap -1→0
+                            if !(val == prev || val == prev - 1 || (prev == -1 && val == 0)) {
+                                metrics.splice_count_errors += 1; // increment TR-101 counter
+                            }
+                            metrics.last_splice_value = Some(val);
+                        }
+                    }
+                }
+            }
+        }
+
+        metrics.on_packet(
+            chunk,
+            pid,
+            payload_unit_start,
+            0x0000,
+            pat_crc_ok,
+            pmt_crc_ok,
+            pcr_found,
+            cat_crc_ok,
+            nit_crc_ok,
+            sdt_crc_ok,
+            eit_crc_ok,
+            table_id,            
+        );
     }
 }
 
