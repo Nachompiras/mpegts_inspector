@@ -1,0 +1,283 @@
+use std::{
+    collections::HashMap,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    time::{Duration, Instant},
+};
+
+use bitstream_io::{BitReader, BE};
+use bytes::BytesMut;
+use clap::Parser;
+use socket2::{Domain, Protocol, Socket, Type};
+use tokio::{net::UdpSocket, time};
+
+mod psi;
+mod es;
+use psi::{parse_pat, parse_pmt, PatSection, PmtSection};
+use es::{parse_aac_adts, parse_h26x_sps};
+
+/// CLI
+#[derive(Parser, Debug)]
+struct Opt {
+    /// Multicast or unicast socket address to bind **and** listen to, e.g. 239.1.1.2:1234
+    #[clap(long, default_value_t = String::from("239.1.1.2:1234"))]
+    addr: String,
+
+    /// How often (in seconds) to print a report
+    #[clap(long, default_value_t = 2)]
+    refresh: u64,
+}
+
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> anyhow::Result<()> {
+    let opt = Opt::parse();
+    let socket = create_udp_socket(&opt.addr)?;
+    let sock = UdpSocket::from_std(socket.into())?;
+
+    let mut buf = [0u8; 2048];
+    let mut pat_map = HashMap::<u16, PatSection>::new(); // program_number -> PAT info
+    let mut pmt_map = HashMap::<u16, PmtSection>::new(); // pmt_pid -> parsed PMT
+    let mut es_stats = HashMap::<u16, EsStats>::new(); // pid -> rolling stats
+
+    let mut last_print = Instant::now();
+
+    loop {
+        let n = sock.recv(&mut buf).await?;
+        if n == 0 {
+            continue;
+        }
+
+        // iterate TS packets (188 B aligned)
+        for chunk in buf[..n].chunks_exact(188) {
+            if chunk[0] != 0x47 {
+                continue; // bad sync
+            }
+            let pid = ((chunk[1] & 0x1F) as u16) << 8 | chunk[2] as u16;
+            let payload_unit_start = chunk[1] & 0x40 != 0;
+            let adaption_field_ctrl = (chunk[3] & 0x30) >> 4;
+
+            let mut payload_offset = 4usize;
+            if adaption_field_ctrl == 2 || adaption_field_ctrl == 0 {
+                continue; // no payload
+            }
+            if adaption_field_ctrl == 3 {
+                // skip adaptation field
+                let adap_len = chunk[4] as usize;
+                payload_offset += 1 + adap_len;
+                if payload_offset >= 188 {
+                    continue;
+                }
+            }
+            let payload = &chunk[payload_offset..];
+
+            // PAT
+            if pid == 0x0000 && payload_unit_start {
+                if let Ok(pat) = parse_pat(payload) {
+                    for entry in &pat.programs {
+                        pat_map.insert(entry.program_number, pat.clone());
+                    }
+                }
+            }
+
+            // PMT
+            if let Some((_prog_num, pat)) = pat_map.iter().find(|(_, p)| p.programs.iter().any(|e| e.pmt_pid == pid)) {
+                if payload_unit_start {
+                    if let Ok(pmt) = parse_pmt(payload) {
+                        pmt_map.insert(pid, pmt);
+                    }
+                }
+            }
+
+            // ES parsing / bitrate
+            if let Some(stats) = es_stats.get_mut(&pid) {
+                stats.bytes += 188;
+                if stats.codec.is_none() {
+                    // first PES packet generally starts with PES start code 0x000001
+                    if payload_unit_start && payload.len() >= 6 && payload[0] == 0x00 && payload[1] == 0x00 && payload[2] == 0x01 {
+                        let stream_id = payload[3];
+                        let pes_hdr_len = 9 + payload[8] as usize;
+                        if pes_hdr_len < payload.len() {
+                            let es_payload = &payload[pes_hdr_len..];
+                            match stats.stream_type {
+                                0x1B | 0x24 => {
+                                    if let Some(v) = parse_h26x_sps(es_payload) {
+                                        stats.codec = Some(CodecInfo::Video(v));
+                                    }
+                                }
+                                0x0F => {
+                                    if let Some(aac) = parse_aac_adts(es_payload) {
+                                        stats.codec = Some(CodecInfo::Audio(aac));
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                // ---------- FPS estimation using PTS ----------
+                if let Some(CodecInfo::Video(ref mut vinfo)) = stats.codec {
+                    // We only evaluate on PES start for video streams (stream_id 0xE0–0xEF)
+                    if payload_unit_start && payload.len() > 14 && payload.starts_with(&[0x00, 0x00, 0x01]) {
+                        let stream_id = payload[3];
+                        if stream_id & 0xF0 == 0xE0 {
+                            // PTS flag present?
+                            let pts_dts_flags = (payload[7] & 0xC0) >> 6;
+                            if pts_dts_flags & 0b10 != 0 {
+                                // PTS is stored in 5 bytes starting at index 9
+                                let p = &payload[9..14];
+                                let pts: u64 = (((p[0] as u64 & 0x0E) << 29)
+                                    |  ((p[1] as u64) << 22)
+                                    | (((p[2] as u64 & 0xFE) >> 1) << 15)
+                                    |  ((p[3] as u64) << 7)
+                                    |  ((p[4] as u64) >> 1));
+
+                                if let Some(prev) = stats.last_pts {
+                                    if pts > prev {
+                                        let delta = pts - prev; // units: 1/90000 s
+                                        if delta != 0 {
+                                            let fps_est = 90000.0 / delta as f32;
+                                            // only overwrite if SPS didn't carry fps info
+                                            if vinfo.fps == 0.0 {
+                                                vinfo.fps = (fps_est * 100.0).round() / 100.0;
+                                            }
+                                        }
+                                    }
+                                }
+                                stats.last_pts = Some(pts);
+                            }
+                        }
+                    }
+                }
+            } else if payload_unit_start {
+                // maybe new ES PID
+                if let Some((_pmt_pid, pmt)) = pmt_map
+                    .iter()
+                    .find(|(_, p)| p.streams.iter().any(|s| s.elementary_pid == pid))
+                {
+                    let stream = pmt
+                        .streams
+                        .iter()
+                        .find(|s| s.elementary_pid == pid)
+                        .unwrap();
+                    es_stats.insert(
+                        pid,
+                        EsStats {
+                            stream_type: stream.stream_type,
+                            codec: None,
+                            bytes: 188,
+                            start: Instant::now(),
+                            last_pts: None,
+                        },
+                    );
+                }
+            }
+        }
+
+        if last_print.elapsed() >= Duration::from_secs(opt.refresh) {
+            print_report(&pat_map, &pmt_map, &mut es_stats);
+            last_print = Instant::now();
+        }
+    }
+}
+
+/// Join multicast / bind unicast socket helper
+fn create_udp_socket(addr: &str) -> anyhow::Result<Socket> {
+    let sock_addr: SocketAddr = addr.parse()?;
+    let ip = match sock_addr.ip() {
+        IpAddr::V4(v4) => v4,
+        _ => anyhow::bail!("only IPv4 is supported"),
+    };
+
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_reuse_address(true)?;
+    socket.bind(&sock_addr.into())?;
+
+    if ip.is_multicast() {
+        let iface = Ipv4Addr::UNSPECIFIED; // default interface
+        socket.join_multicast_v4(&ip, &iface)?;
+    }
+    socket.set_nonblocking(true)?;
+    Ok(socket)
+}
+
+/// Stores rolling statistics for an ES
+struct EsStats {
+    stream_type: u8,
+    codec: Option<CodecInfo>,
+    bytes: usize,
+    start: Instant,
+    last_pts: Option<u64>,
+}
+
+#[derive(Clone)]
+enum CodecInfo {
+    Video(VideoInfo),
+    Audio(AacInfo),
+}
+
+#[derive(Clone)]
+struct VideoInfo {
+    codec: &'static str,
+    width: u16,
+    height: u16,
+    fps: f32,
+    chroma: String,
+}
+
+#[derive(Clone)]
+struct AacInfo {
+    profile: &'static str,
+    sr: u32,
+    channels: u8,
+}
+
+fn print_report(
+    pat_map: &HashMap<u16, PatSection>,
+    pmt_map: &HashMap<u16, PmtSection>,
+    es_stats: &mut HashMap<u16, EsStats>,
+) {
+    println!("================ MPEG-TS Inspector =================");
+    for (prog_num, pat) in pat_map {
+        println!("Program #{prog_num}");
+        // find PMT
+        if let Some(pmt_pid) = pat.programs.iter().find(|p| p.program_number == *prog_num).map(|p| p.pmt_pid) {
+            if let Some(pmt) = pmt_map.get(&pmt_pid) {
+                for s in &pmt.streams {
+                    let pid = s.elementary_pid;
+                    if let Some(stat) = es_stats.get(&pid) {
+                        let seconds = stat.start.elapsed().as_secs_f64();
+                        let bitrate_kbps = (stat.bytes as f64 * 8.0 / 1000.0) / seconds.max(0.1);
+                        let (codec_name, extra) = match &stat.codec {
+                            Some(CodecInfo::Video(v)) => (
+                                v.codec,
+                                format!("{:}×{:} {:.2} fps {}", v.width, v.height, v.fps, v.chroma),
+                            ),
+                            Some(CodecInfo::Audio(a)) => (
+                                "AAC",
+                                format!("{}ch {} Hz ({})", a.channels, a.sr, a.profile),
+                            ),
+                            None => ("?", String::new()),
+                        };
+                        println!(
+                            "  PID 0x{pid:04X} | {: <4} {: <9} | {:>6.1} kb/s {}",
+                            stream_type_name(s.stream_type),
+                            codec_name,
+                            bitrate_kbps,
+                            extra
+                        );
+                    }
+                }
+            }
+        }
+    }
+    // prune old pids
+    es_stats.retain(|_, s| s.start.elapsed() < Duration::from_secs(30));
+}
+
+fn stream_type_name(st: u8) -> &'static str {
+    match st {
+        0x1B => "H.264",
+        0x24 => "HEVC",
+        0x0F => "AAC",
+        _ => "unk",
+    }
+}

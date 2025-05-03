@@ -1,0 +1,13 @@
+[package]
+name = "mpegts_inspector"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio        = { version = "1.38", features = ["full"] }
+socket2      = "0.5"
+bytes        = "1"
+clap         = { version = "4", features = ["derive"] }
+crc          = "3"
+anyhow = "1.0.98"
+bitstream-io = "4.0.0"
