@@ -11,6 +11,13 @@ pub mod inspector {
     pub async fn run(opts: Options) -> anyhow::Result<()> {
         crate::core::run(opts)
     }
+     /// Entry-point that reads TS packets from a `tokio::broadcast` channel.
+     pub async fn run_from_broadcast(
+        mut rx: tokio::sync::broadcast::Receiver<Vec<u8>>,
+        refresh_secs: u64,
+    ) -> anyhow::Result<()> {
+        crate::core::run_broadcast(&mut rx, refresh_secs).await
+    }    
 }
 
 mod psi;
