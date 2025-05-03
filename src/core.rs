@@ -35,131 +35,43 @@ pub async fn run(opts: crate::inspector::Options) -> anyhow::Result<()> {
             if chunk[0] != 0x47 {
                 continue; // bad sync
             }
-            let pid = ((chunk[1] & 0x1F) as u16) << 8 | chunk[2] as u16;
-            let payload_unit_start = chunk[1] & 0x40 != 0;
-            let adaption_field_ctrl = (chunk[3] & 0x30) >> 4;
-
-            let mut payload_offset = 4usize;
-            if adaption_field_ctrl == 2 || adaption_field_ctrl == 0 {
-                continue; // no payload
-            }
-            if adaption_field_ctrl == 3 {
-                // skip adaptation field
-                let adap_len = chunk[4] as usize;
-                payload_offset += 1 + adap_len;
-                if payload_offset >= 188 {
-                    continue;
-                }
-            }
-            let payload = &chunk[payload_offset..];
-
-            // PAT
-            if pid == 0x0000 && payload_unit_start {
-                if let Ok(pat) = parse_pat(payload) {
-                    for entry in &pat.programs {
-                        pat_map.insert(entry.program_number, pat.clone());
-                    }
-                }
-            }
-
-            // PMT
-            if let Some((_prog_num, pat)) = pat_map.iter().find(|(_, p)| p.programs.iter().any(|e| e.pmt_pid == pid)) {
-                if payload_unit_start {
-                    if let Ok(pmt) = parse_pmt(payload) {
-                        pmt_map.insert(pid, pmt);
-                    }
-                }
-            }
-
-            // ES parsing / bitrate
-            if let Some(stats) = es_stats.get_mut(&pid) {
-                stats.bytes += 188;
-                if stats.codec.is_none() {
-                    // first PES packet generally starts with PES start code 0x000001
-                    if payload_unit_start && payload.len() >= 6 && payload[0] == 0x00 && payload[1] == 0x00 && payload[2] == 0x01 {
-                        let stream_id = payload[3];
-                        let pes_hdr_len = 9 + payload[8] as usize;
-                        if pes_hdr_len < payload.len() {
-                            let es_payload = &payload[pes_hdr_len..];
-                            match stats.stream_type {
-                                0x1B | 0x24 => {
-                                    if let Some(v) = parse_h26x_sps(es_payload) {
-                                        stats.codec = Some(CodecInfo::Video(v));
-                                    }
-                                }
-                                0x0F => {
-                                    if let Some(aac) = parse_aac_adts(es_payload) {
-                                        stats.codec = Some(CodecInfo::Audio(aac));
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-                // ---------- FPS estimation using PTS ----------
-                if let Some(CodecInfo::Video(ref mut vinfo)) = stats.codec {
-                    // We only evaluate on PES start for video streams (stream_id 0xE0–0xEF)
-                    if payload_unit_start && payload.len() > 14 && payload.starts_with(&[0x00, 0x00, 0x01]) {
-                        let stream_id = payload[3];
-                        if stream_id & 0xF0 == 0xE0 {
-                            // PTS flag present?
-                            let pts_dts_flags = (payload[7] & 0xC0) >> 6;
-                            if pts_dts_flags & 0b10 != 0 {
-                                // PTS is stored in 5 bytes starting at index 9
-                                let p = &payload[9..14];
-                                let pts: u64 = (((p[0] as u64 & 0x0E) << 29)
-                                    |  ((p[1] as u64) << 22)
-                                    | (((p[2] as u64 & 0xFE) >> 1) << 15)
-                                    |  ((p[3] as u64) << 7)
-                                    |  ((p[4] as u64) >> 1));
-
-                                if let Some(prev) = stats.last_pts {
-                                    if pts > prev {
-                                        let delta = pts - prev; // units: 1/90000 s
-                                        if delta != 0 {
-                                            let fps_est = 90000.0 / delta as f32;
-                                            // only overwrite if SPS didn't carry fps info
-                                            if vinfo.fps == 0.0 {
-                                                vinfo.fps = (fps_est * 100.0).round() / 100.0;
-                                            }
-                                        }
-                                    }
-                                }
-                                stats.last_pts = Some(pts);
-                            }
-                        }
-                    }
-                }
-            } else if payload_unit_start {
-                // maybe new ES PID
-                if let Some((_pmt_pid, pmt)) = pmt_map
-                    .iter()
-                    .find(|(_, p)| p.streams.iter().any(|s| s.elementary_pid == pid))
-                {
-                    let stream = pmt
-                        .streams
-                        .iter()
-                        .find(|s| s.elementary_pid == pid)
-                        .unwrap();
-                    es_stats.insert(
-                        pid,
-                        EsStats {
-                            stream_type: stream.stream_type,
-                            codec: None,
-                            bytes: 188,
-                            start: Instant::now(),
-                            last_pts: None,
-                        },
-                    );
-                }
-            }
+            process_ts_packet(chunk, &mut pat_map, &mut pmt_map, &mut es_stats);
         }
 
         if last_print.elapsed() >= Duration::from_secs(opts.refresh_secs) {
             // Limpia stats viejos antes de generar JSON
             es_stats.retain(|_, s| s.start.elapsed() < Duration::from_secs(30));
         
+            let json = report_json(&pat_map, &pmt_map, &es_stats);
+            println!("{json}");
+            last_print = Instant::now();
+        }
+    }
+}
+
+/// Same inspection loop but reading from a `broadcast::Receiver` instead of UDP.
+///
+/// A sender must push `Vec<u8>` buffers that are 188‑byte‑aligned.
+pub async fn run_broadcast(
+    rx: &mut tokio::sync::broadcast::Receiver<Vec<u8>>,
+    refresh_secs: u64,
+) -> anyhow::Result<()> {
+    use tokio::time::Instant;
+
+    let mut pat_map = HashMap::<u16, PatSection>::new();
+    let mut pmt_map = HashMap::<u16, PmtSection>::new();
+    let mut es_stats = HashMap::<u16, EsStats>::new();
+    let mut last_print = Instant::now();
+
+    loop {
+        let buf = rx.recv().await?;          // waits for next TS chunk
+        for chunk in buf.chunks_exact(188) {
+            if chunk[0] != 0x47 { continue; }
+            process_ts_packet(chunk, &mut pat_map, &mut pmt_map, &mut es_stats);
+        }
+
+        if last_print.elapsed() >= Duration::from_secs(refresh_secs) {
+            es_stats.retain(|_, s| s.start.elapsed() < Duration::from_secs(30));
             let json = report_json(&pat_map, &pmt_map, &es_stats);
             println!("{json}");
             last_print = Instant::now();
@@ -356,6 +268,127 @@ fn report_json<'a>(
         programs: programs_out,
     };
     serde_json::to_string_pretty(&rep).unwrap()
+}
+
+fn process_ts_packet(
+    chunk: &[u8],
+    pat_map: &mut HashMap<u16, PatSection>,
+    pmt_map: &mut HashMap<u16, PmtSection>,
+    es_stats: &mut HashMap<u16, EsStats>,
+) {
+    let pid = ((chunk[1] & 0x1F) as u16) << 8 | chunk[2] as u16;
+    let payload_unit_start = chunk[1] & 0x40 != 0;
+    let adaption_field_ctrl = (chunk[3] & 0x30) >> 4;
+    let mut payload_offset = 4usize;
+    if adaption_field_ctrl == 2 || adaption_field_ctrl == 0 {
+        return;
+    }
+    if adaption_field_ctrl == 3 {
+        let adap_len = chunk[4] as usize;
+        payload_offset += 1 + adap_len;
+        if payload_offset >= 188 {
+            return;
+        }
+    }
+    let payload = &chunk[payload_offset..];
+
+    // PAT
+    if pid == 0x0000 && payload_unit_start {
+        if let Ok(pat) = parse_pat(payload) {
+            for entry in &pat.programs {
+                pat_map.insert(entry.program_number, pat.clone());
+            }
+        }
+    }
+
+    // PMT
+    if let Some((_prog_num, pat)) =
+        pat_map.iter().find(|(_, p)| p.programs.iter().any(|e| e.pmt_pid == pid))
+    {
+        if payload_unit_start {
+            if let Ok(pmt) = parse_pmt(payload) {
+                pmt_map.insert(pid, pmt);
+            }
+        }
+    }
+
+    // ES parsing / bitrate
+    if let Some(stats) = es_stats.get_mut(&pid) {
+        stats.bytes += 188;
+        if stats.codec.is_none() && payload_unit_start && payload.len() >= 6
+            && payload.starts_with(&[0x00, 0x00, 0x01])
+        {
+            let pes_hdr_len = 9 + payload[8] as usize;
+            if pes_hdr_len < payload.len() {
+                let es_payload = &payload[pes_hdr_len..];
+                match stats.stream_type {
+                    0x1B | 0x24 => {
+                        if let Some(v) = parse_h26x_sps(es_payload) {
+                            stats.codec = Some(CodecInfo::Video(v));
+                        }
+                    }
+                    0x0F => {
+                        if let Some(aac) = parse_aac_adts(es_payload) {
+                            stats.codec = Some(CodecInfo::Audio(aac));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // FPS by PTS (reuse existing code)
+        if let Some(CodecInfo::Video(ref mut vinfo)) = stats.codec {
+            if payload_unit_start && payload.len() > 14
+                && payload.starts_with(&[0x00, 0x00, 0x01])
+            {
+                let stream_id = payload[3];
+                if stream_id & 0xF0 == 0xE0 {
+                    let pts_dts_flags = (payload[7] & 0xC0) >> 6;
+                    if pts_dts_flags & 0b10 != 0 {
+                        let p = &payload[9..14];
+                        let pts: u64 = (((p[0] as u64 & 0x0E) << 29)
+                            | ((p[1] as u64) << 22)
+                            | (((p[2] as u64 & 0xFE) >> 1) << 15)
+                            | ((p[3] as u64) << 7)
+                            | ((p[4] as u64) >> 1));
+                        if let Some(prev) = stats.last_pts {
+                            if pts > prev {
+                                let delta = pts - prev;
+                                if delta != 0 {
+                                    let fps_est = 90000.0 / delta as f32;
+                                    if vinfo.fps == 0.0 {
+                                        vinfo.fps = (fps_est * 100.0).round() / 100.0;
+                                    }
+                                }
+                            }
+                        }
+                        stats.last_pts = Some(pts);
+                    }
+                }
+            }
+        }
+    } else if payload_unit_start {
+        if let Some((_pmt_pid, pmt)) = pmt_map
+            .iter()
+            .find(|(_, p)| p.streams.iter().any(|s| s.elementary_pid == pid))
+        {
+            let stream = pmt
+                .streams
+                .iter()
+                .find(|s| s.elementary_pid == pid)
+                .unwrap();
+            es_stats.insert(
+                pid,
+                EsStats {
+                    stream_type: stream.stream_type,
+                    codec: None,
+                    bytes: 188,
+                    start: Instant::now(),
+                    last_pts: None,
+                },
+            );
+        }
+    }
 }
 
 fn stream_type_name(st: u8) -> &'static str {
