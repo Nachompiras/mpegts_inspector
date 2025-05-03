@@ -3,12 +3,10 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     time::{Duration, Instant},
 };
-
-use bitstream_io::{BitReader, BE};
-use bytes::BytesMut;
+use serde::Serialize;
 use clap::Parser;
 use socket2::{Domain, Protocol, Socket, Type};
-use tokio::{net::UdpSocket, time};
+use tokio::{net::UdpSocket};
 
 mod psi;
 mod es;
@@ -173,7 +171,11 @@ async fn main() -> anyhow::Result<()> {
         }
 
         if last_print.elapsed() >= Duration::from_secs(opt.refresh) {
-            print_report(&pat_map, &pmt_map, &mut es_stats);
+            // Limpia stats viejos antes de generar JSON
+            es_stats.retain(|_, s| s.start.elapsed() < Duration::from_secs(30));
+        
+            let json = report_json(&pat_map, &pmt_map, &es_stats);
+            println!("{json}");
             last_print = Instant::now();
         }
     }
@@ -230,6 +232,39 @@ struct AacInfo {
     channels: u8,
 }
 
+#[derive(Serialize)]
+struct EsJson<'a> {
+    pid:        u16,
+    stream_type:u8,
+    codec:      &'a str,
+    bitrate_kbps:f64,
+    // campos opcionales que no siempre existen:
+    #[serde(skip_serializing_if = "Option::is_none")]
+    width:      Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    height:     Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fps:        Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chroma:     Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    channels:   Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sample_rate:Option<u32>,
+}
+
+#[derive(Serialize)]
+struct ProgramJson<'a> {
+    program: u16,
+    streams: Vec<EsJson<'a>>,
+}
+
+#[derive(Serialize)]
+struct ReportJson<'a> {
+    ts_time: String,
+    programs: Vec<ProgramJson<'a>>,
+}
+
 fn print_report(
     pat_map: &HashMap<u16, PatSection>,
     pmt_map: &HashMap<u16, PmtSection>,
@@ -271,6 +306,70 @@ fn print_report(
     }
     // prune old pids
     es_stats.retain(|_, s| s.start.elapsed() < Duration::from_secs(30));
+}
+
+fn report_json<'a>(
+    pat_map: &'a HashMap<u16, PatSection>,
+    pmt_map: &'a HashMap<u16, PmtSection>,
+    es_stats: &'a HashMap<u16, EsStats>,
+) -> String {
+    let mut programs_out = Vec::new();
+
+    for (prog_num, pat) in pat_map {
+        if let Some(pmt_pid) = pat.programs
+                                  .iter()
+                                  .find(|p| p.program_number == *prog_num)
+                                  .map(|p| p.pmt_pid)
+        {
+            if let Some(pmt) = pmt_map.get(&pmt_pid) {
+                let mut es_vec = Vec::new();
+                for s in &pmt.streams {
+                    if let Some(stat) = es_stats.get(&s.elementary_pid) {
+                        let secs = stat.start.elapsed().as_secs_f64().max(0.1);
+                        let br   = (stat.bytes as f64 * 8.0 / 1000.0) / secs;
+
+                        match &stat.codec {
+                            Some(CodecInfo::Video(v)) => es_vec.push(EsJson {
+                                pid: s.elementary_pid,
+                                stream_type: s.stream_type,
+                                codec: v.codec,
+                                bitrate_kbps: br,
+                                width: Some(v.width),
+                                height: Some(v.height),
+                                fps: if v.fps > 0.0 { Some(v.fps) } else { None },
+                                chroma: Some(&v.chroma),
+                                channels: None,
+                                sample_rate: None,
+                            }),
+                            Some(CodecInfo::Audio(a)) => es_vec.push(EsJson {
+                                pid: s.elementary_pid,
+                                stream_type: s.stream_type,
+                                codec: "AAC",
+                                bitrate_kbps: br,
+                                width: None,
+                                height: None,
+                                fps: None,
+                                chroma: None,
+                                channels: Some(a.channels),
+                                sample_rate: Some(a.sr),
+                            }),
+                            None => {}
+                        }
+                    }
+                }
+                programs_out.push(ProgramJson {
+                    program: *prog_num,
+                    streams: es_vec,
+                });
+            }
+        }
+    }
+
+    let rep = ReportJson {
+        ts_time: chrono::Utc::now().to_rfc3339(),
+        programs: programs_out,
+    };
+    serde_json::to_string_pretty(&rep).unwrap()
 }
 
 fn stream_type_name(st: u8) -> &'static str {
