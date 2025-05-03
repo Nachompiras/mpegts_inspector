@@ -197,25 +197,25 @@ struct EsStats {
 }
 
 #[derive(Clone)]
-enum CodecInfo {
+pub enum CodecInfo {
     Video(VideoInfo),
     Audio(AacInfo),
 }
 
 #[derive(Clone)]
-struct VideoInfo {
-    codec: &'static str,
-    width: u16,
-    height: u16,
-    fps: f32,
-    chroma: String,
+pub struct VideoInfo {
+    pub codec: &'static str,
+    pub width: u16,
+    pub height: u16,
+    pub fps: f32,
+    pub chroma: String,
 }
 
 #[derive(Clone)]
-struct AacInfo {
-    profile: &'static str,
-    sr: u32,
-    channels: u8,
+pub struct AacInfo {
+    pub profile: &'static str,
+    pub sr: u32,
+    pub channels: u8,
 }
 
 #[derive(Serialize)]

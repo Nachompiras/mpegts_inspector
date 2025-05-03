@@ -1,6 +1,6 @@
 use bitstream_io::{BitRead, BitReader, BigEndian};
 
-use super::{AacInfo, VideoInfo};
+use crate::core::{AacInfo, VideoInfo};
 
 /// Tries to find the first SPS in a H.264 or HEVC ES payload and returns parsed info
 pub fn parse_h26x_sps(data: &[u8]) -> Option<VideoInfo> {
