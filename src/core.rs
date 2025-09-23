@@ -79,6 +79,110 @@ pub async fn run_broadcast(
     }
 }
 
+/// Advanced broadcast inspection with runtime analysis control.
+pub async fn run_broadcast_with_control(
+    rx: &mut tokio::sync::broadcast::Receiver<Vec<u8>>,
+    control_rx: &mut tokio::sync::broadcast::Receiver<crate::inspector::AnalysisCommand>,
+    refresh_secs: u64,
+    initial_mode: Option<crate::inspector::AnalysisMode>,
+) -> anyhow::Result<()> {
+    use crate::inspector::{AnalysisCommand, AnalysisMode};
+
+    let mut si_cache = si_cache::SiCache::default();
+    let mut current_mode = initial_mode;
+    let mut tr101 = match current_mode {
+        Some(AnalysisMode::Tr101) => Some(tr101::Tr101Metrics::new()),
+        _ => None,
+    };
+    let mut pat_map = HashMap::<u16, PatSection>::new();
+    let mut pmt_map = HashMap::<u16, PmtSection>::new();
+    let mut es_stats = HashMap::<u16, EsStats>::new();
+    let mut last_print = Instant::now();
+
+    loop {
+        tokio::select! {
+            // Handle TS packet data
+            buf_result = rx.recv() => {
+                let buf = buf_result?;
+                for chunk in buf.chunks_exact(188) {
+                    if chunk[0] != 0x47 { continue; }
+
+                    // Only pass TR101 metrics if in Tr101 mode
+                    let tr101_ref = match current_mode {
+                        Some(AnalysisMode::Tr101) => tr101.as_mut(),
+                        _ => None,
+                    };
+
+                    // Process packet based on current analysis mode
+                    match current_mode {
+                        Some(AnalysisMode::None) => {
+                            // Skip all analysis except basic packet counting
+                            continue;
+                        },
+                        Some(AnalysisMode::Mux) | Some(AnalysisMode::Tr101) => {
+                            process_ts_packet(chunk, &mut pat_map, &mut pmt_map, &mut es_stats, &mut si_cache, tr101_ref);
+                        },
+                        None => {
+                            // Analysis stopped, just consume packets
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            // Handle analysis control commands
+            cmd_result = control_rx.recv() => {
+                match cmd_result? {
+                    AnalysisCommand::Start(mode) => {
+                        current_mode = Some(mode);
+                        match mode {
+                            AnalysisMode::Tr101 => {
+                                if tr101.is_none() {
+                                    tr101 = Some(tr101::Tr101Metrics::new());
+                                }
+                            },
+                            AnalysisMode::Mux => {
+                                // Keep existing tr101 instance but don't use it
+                            },
+                            AnalysisMode::None => {
+                                // Keep all data structures but minimal processing
+                            }
+                        }
+                        eprintln!("Analysis mode changed to: {:?}", mode);
+                    },
+                    AnalysisCommand::Stop => {
+                        current_mode = None;
+                        eprintln!("Analysis stopped");
+                    },
+                    AnalysisCommand::GetStatus => {
+                        let status = crate::inspector::AnalysisStatus {
+                            current_mode,
+                            is_running: current_mode.is_some(),
+                        };
+                        eprintln!("Analysis status: {:?}", status);
+                    }
+                }
+            }
+        }
+
+        // Generate reports at specified intervals
+        if current_mode.is_some() && last_print.elapsed() >= Duration::from_secs(refresh_secs) {
+            es_stats.retain(|_, s| s.start.elapsed() < Duration::from_secs(30));
+
+            // Generate report based on current mode
+            let default_tr101 = tr101::Tr101Metrics::default();
+            let tr101_ref = match current_mode {
+                Some(AnalysisMode::Tr101) => tr101.as_ref().unwrap_or(&default_tr101),
+                _ => &default_tr101, // Empty metrics for Mux mode
+            };
+
+            let json = report_json(&pat_map, &pmt_map, &es_stats, tr101_ref);
+            println!("{json}");
+            last_print = Instant::now();
+        }
+    }
+}
+
 /// Join multicast / bind unicast socket helper
 fn create_udp_socket(addr: &str) -> anyhow::Result<Socket> {
     let sock_addr: SocketAddr = addr.parse()?;

@@ -126,13 +126,48 @@ cargo run --release -- --addr 127.0.0.1:8080 --refresh 5  # Local with 5s report
 ## 🔧 Advanced Features
 
 ### **Broadcast Integration API**
+
+#### **Basic Integration (Legacy)**
 ```rust
 use mpegts_inspector::inspector;
 
-// For integration with existing streaming pipelines
+// Simple broadcast integration with fixed analysis mode
 let (tx, rx) = tokio::sync::broadcast::channel(1000);
-inspector::run_from_broadcast(rx, 2, true).await?;
+inspector::run_from_broadcast(rx, 2, true).await?;  // TR101 analysis enabled
 ```
+
+#### **Advanced Integration with Runtime Control**
+```rust
+use mpegts_inspector::inspector::{self, AnalysisMode, AnalysisCommand};
+
+// Set up data and control channels
+let (data_tx, data_rx) = tokio::sync::broadcast::channel(1000);
+let (control_tx, control_rx) = tokio::sync::broadcast::channel(100);
+
+// Start with MUX mode (codec detection only, no TR101 analysis)
+let inspector_task = tokio::spawn(async move {
+    inspector::run_from_broadcast_with_control(
+        data_rx,
+        control_rx,
+        2,                           // 2-second reports
+        Some(AnalysisMode::Mux)      // Start with MUX mode
+    ).await
+});
+
+// Runtime control examples
+control_tx.send(AnalysisCommand::Start(AnalysisMode::Tr101))?;  // Enable full TR101
+control_tx.send(AnalysisCommand::Start(AnalysisMode::Mux))?;    // Switch to MUX only
+control_tx.send(AnalysisCommand::Stop)?;                       // Stop analysis
+control_tx.send(AnalysisCommand::GetStatus)?;                  // Query status
+
+// Feed TS data
+data_tx.send(ts_packet_buffer)?;
+```
+
+#### **Analysis Modes**
+- **`AnalysisMode::Mux`**: Stream detection, codec analysis, bitrate calculation (low CPU)
+- **`AnalysisMode::Tr101`**: Full TR 101 290 compliance monitoring (higher CPU)
+- **`AnalysisMode::None`**: Minimal processing, packet consumption only
 
 ### **Stream Type Detection Matrix**
 
@@ -197,6 +232,7 @@ interface ElementaryStream {
 - **No FFmpeg dependencies** - pure Rust implementation
 - **Async/await** architecture for high throughput
 - **Memory-efficient** stream processing
+- **Dynamic analysis control** - switch between MUX/TR101 modes at runtime
 - **Automatic multicast join** for broadcast monitoring
 - **Robust error handling** with graceful degradation
 
