@@ -1,6 +1,52 @@
 use bitstream_io::{BitRead, BitReader, BigEndian};
 
-use crate::core::{AacInfo, VideoInfo};
+use crate::core::{AudioInfo, VideoInfo};
+
+/// Parse MPEG-2 sequence header for video parameters
+pub fn parse_mpeg2_seq_hdr(data: &[u8]) -> Option<VideoInfo> {
+    // MPEG-2 sequence header starts with 0x000001B3
+    for i in 0..data.len().saturating_sub(8) {
+        if data[i] == 0x00 && data[i + 1] == 0x00 && data[i + 2] == 0x01 && data[i + 3] == 0xB3 {
+            let seq_hdr = &data[i + 4..];
+            if seq_hdr.len() >= 8 {
+                // Parse sequence header
+                let horizontal_size = ((seq_hdr[0] as u16) << 4) | ((seq_hdr[1] as u16) >> 4);
+                let vertical_size = ((seq_hdr[1] as u16 & 0x0F) << 8) | (seq_hdr[2] as u16);
+                let aspect_ratio_info = (seq_hdr[3] >> 4) & 0x0F;
+                let frame_rate_code = seq_hdr[3] & 0x0F;
+
+                let fps = match frame_rate_code {
+                    1 => 23.976,
+                    2 => 24.0,
+                    3 => 25.0,
+                    4 => 29.97,
+                    5 => 30.0,
+                    6 => 50.0,
+                    7 => 59.94,
+                    8 => 60.0,
+                    _ => 0.0,
+                };
+
+                let aspect_ratio = match aspect_ratio_info {
+                    1 => "1:1",     // Square pixels
+                    2 => "4:3",     // 4:3 display
+                    3 => "16:9",    // 16:9 display
+                    4 => "2.21:1",  // 2.21:1 display
+                    _ => "?",
+                };
+
+                return Some(VideoInfo {
+                    codec: "MPEG-2",
+                    width: horizontal_size,
+                    height: vertical_size,
+                    fps: fps as f32,
+                    chroma: "4:2:0".into(), // MPEG-2 is typically 4:2:0
+                });
+            }
+        }
+    }
+    None
+}
 
 /// Tries to find the first SPS in a H.264 or HEVC ES payload and returns parsed info
 pub fn parse_h26x_sps(data: &[u8]) -> Option<VideoInfo> {
@@ -226,7 +272,7 @@ fn remove_emulation_prevention(data: &[u8]) -> Vec<u8> {
 }
 
 /// Parse first ADTS header in the payload
-pub fn parse_aac_adts(data: &[u8]) -> Option<AacInfo> {
+pub fn parse_aac_adts(data: &[u8]) -> Option<AudioInfo> {
     for i in 0..data.len().saturating_sub(7) {
         if data[i] == 0xFF && (data[i + 1] & 0xF6) == 0xF0 {
             let sr_index = (data[i + 2] & 0x3C) >> 2;
@@ -246,11 +292,118 @@ pub fn parse_aac_adts(data: &[u8]) -> Option<AacInfo> {
                 11 => 8000,
                 _ => 0,
             };
-            return Some(AacInfo {
-                profile: "LC",
-                sr: sample_rate,
-                channels: channel_cfg,
+            return Some(AudioInfo {
+                codec: "AAC",
+                profile: Some("LC"),
+                sr: Some(sample_rate),
+                channels: Some(channel_cfg),
             });
+        }
+    }
+    None
+}
+
+/// Parse MPEG Audio (MP1/MP2/MP3) frame header
+pub fn parse_mp2(data: &[u8]) -> Option<AudioInfo> {
+    // MPEG Audio frame starts with 0xFFF (12 bits sync word)
+    for i in 0..data.len().saturating_sub(4) {
+        if data[i] == 0xFF && (data[i + 1] & 0xE0) == 0xE0 {
+            let header = &data[i..i + 4];
+            if header.len() < 4 { continue; }
+
+            // Parse MPEG Audio header
+            let version = (header[1] >> 3) & 0x03;
+            let layer = (header[1] >> 1) & 0x03;
+            let bitrate_index = (header[2] >> 4) & 0x0F;
+            let sample_rate_index = (header[2] >> 2) & 0x03;
+            let channel_mode = (header[3] >> 6) & 0x03;
+
+            // We're specifically looking for Layer II (MP2)
+            if layer != 0x02 { continue; }  // Layer II = 0x02
+
+            let sample_rate = match (version, sample_rate_index) {
+                (0x03, 0x00) => 44100,  // MPEG-1, 44.1kHz
+                (0x03, 0x01) => 48000,  // MPEG-1, 48kHz
+                (0x03, 0x02) => 32000,  // MPEG-1, 32kHz
+                (0x02, 0x00) => 22050,  // MPEG-2, 22.05kHz
+                (0x02, 0x01) => 24000,  // MPEG-2, 24kHz
+                (0x02, 0x02) => 16000,  // MPEG-2, 16kHz
+                (0x00, 0x00) => 11025,  // MPEG-2.5, 11.025kHz
+                (0x00, 0x01) => 12000,  // MPEG-2.5, 12kHz
+                (0x00, 0x02) => 8000,   // MPEG-2.5, 8kHz
+                _ => continue,
+            };
+
+            let channels = match channel_mode {
+                0x00 => 2, // Stereo
+                0x01 => 2, // Joint stereo
+                0x02 => 2, // Dual channel
+                0x03 => 1, // Mono
+                _ => 2,
+            };
+
+            // Layer II bitrates (kbps) for MPEG-1
+            let codec_name = match version {
+                0x03 => "MP2",      // MPEG-1 Layer II
+                0x02 => "MP2",      // MPEG-2 Layer II
+                0x00 => "MP2",      // MPEG-2.5 Layer II
+                _ => continue,
+            };
+
+            return Some(AudioInfo {
+                codec: codec_name,
+                profile: None,
+                sr: Some(sample_rate),
+                channels: Some(channels),
+            });
+        }
+    }
+    None
+}
+
+/// Parse AC-3 sync frame header
+pub fn parse_ac3(data: &[u8]) -> Option<AudioInfo> {
+    // AC-3 sync frame starts with 0x0B77
+    for i in 0..data.len().saturating_sub(5) {
+        if data[i] == 0x0B && data[i + 1] == 0x77 {
+            // Basic AC-3 frame found
+            if i + 4 < data.len() {
+                let fscod = (data[i + 4] >> 6) & 0x03;
+                let acmod = (data[i + 6] >> 5) & 0x07;
+
+                let sample_rate = match fscod {
+                    0x00 => 48000,
+                    0x01 => 44100,
+                    0x02 => 32000,
+                    _ => 0,
+                };
+
+                let channels = match acmod {
+                    0x00 => 2, // 1+1 (dual mono)
+                    0x01 => 1, // 1/0 (mono)
+                    0x02 => 2, // 2/0 (stereo)
+                    0x03 => 3, // 3/0
+                    0x04 => 3, // 2/1
+                    0x05 => 4, // 3/1
+                    0x06 => 4, // 2/2
+                    0x07 => 5, // 3/2
+                    _ => 2,
+                };
+
+                // Check for LFE channel
+                let lfe = if acmod == 0x01 { // mono doesn't use lfeon bit
+                    false
+                } else {
+                    (data[i + 6] >> 4) & 0x01 == 1
+                };
+
+                return Some(AudioInfo {
+                    codec: "AC-3",
+                    profile: None,
+                    sr: Some(sample_rate),
+                    channels: Some(channels + if lfe { 1 } else { 0 }),
+                });
+            }
         }
     }
     None

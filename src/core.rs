@@ -7,7 +7,7 @@ use serde::Serialize;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::{net::UdpSocket};
 
-use crate::{es::{parse_aac_adts, parse_h26x_sps}, psi::{parse_cat, parse_eit_pf, parse_nit, parse_pat, parse_pmt, parse_sdt, PatSection, PmtSection}, si_cache};
+use crate::{es::{parse_aac_adts, parse_ac3, parse_h26x_sps, parse_mpeg2_seq_hdr, parse_mp2}, psi::{parse_cat, parse_eit_pf, parse_nit, parse_pat, parse_pmt, parse_sdt, PatSection, PmtSection}, si_cache};
 use crate::tr101;
 
 pub async fn run(opts: crate::inspector::Options) -> anyhow::Result<()> {
@@ -111,7 +111,8 @@ struct EsStats {
 #[derive(Clone)]
 pub enum CodecInfo {
     Video(VideoInfo),
-    Audio(AacInfo),
+    Audio(AudioInfo),
+    Subtitle(SubtitleInfo),
 }
 
 #[derive(Clone)]
@@ -124,10 +125,16 @@ pub struct VideoInfo {
 }
 
 #[derive(Clone)]
-pub struct AacInfo {
-    pub profile: &'static str,
-    pub sr: u32,
-    pub channels: u8,
+pub struct AudioInfo {
+    pub codec: &'static str,
+    pub profile: Option<&'static str>,
+    pub sr: Option<u32>,
+    pub channels: Option<u8>,
+}
+
+#[derive(Clone)]
+pub struct SubtitleInfo {
+    pub codec: &'static str,
 }
 
 #[derive(Serialize)]
@@ -186,8 +193,15 @@ fn print_report(
                                 format!("{:}×{:} {:.2} fps {}", v.width, v.height, v.fps, v.chroma),
                             ),
                             Some(CodecInfo::Audio(a)) => (
-                                "AAC",
-                                format!("{}ch {} Hz ({})", a.channels, a.sr, a.profile),
+                                a.codec,
+                                format!("{}ch {} Hz",
+                                    a.channels.map_or("?".to_string(), |c| c.to_string()),
+                                    a.sr.map_or("?".to_string(), |sr| sr.to_string())
+                                ),
+                            ),
+                            Some(CodecInfo::Subtitle(sub)) => (
+                                sub.codec,
+                                String::new(),
                             ),
                             None => ("?", String::new()),
                         };
@@ -244,14 +258,26 @@ fn report_json<'a>(
                             Some(CodecInfo::Audio(a)) => es_vec.push(EsJson {
                                 pid: s.elementary_pid,
                                 stream_type: s.stream_type,
-                                codec: "AAC",
+                                codec: a.codec,
                                 bitrate_kbps: br,
                                 width: None,
                                 height: None,
                                 fps: None,
                                 chroma: None,
-                                channels: Some(a.channels),
-                                sample_rate: Some(a.sr),
+                                channels: a.channels,
+                                sample_rate: a.sr,
+                            }),
+                            Some(CodecInfo::Subtitle(sub)) => es_vec.push(EsJson {
+                                pid: s.elementary_pid,
+                                stream_type: s.stream_type,
+                                codec: sub.codec,
+                                bitrate_kbps: br,
+                                width: None,
+                                height: None,
+                                fps: None,
+                                chroma: None,
+                                channels: None,
+                                sample_rate: None,
                             }),
                             None => {}
                         }
@@ -403,6 +429,33 @@ fn process_ts_packet(
     // ES parsing / bitrate
     if let Some(stats) = es_stats.get_mut(&pid) {
         stats.bytes += 188;
+
+        // Handle stream types that don't require PES header parsing first
+        if stats.codec.is_none() {
+            match stats.stream_type {
+                0x06 => {
+                    // DVB Subtitle - no ES parsing needed
+                    stats.codec = Some(CodecInfo::Subtitle(SubtitleInfo {
+                        codec: "DVB Subtitle",
+                    }));
+                }
+                0x03 | 0x04 => {
+                    // MPEG-1 Audio Layer II - can be found directly in payload
+                    if let Some(mp2) = parse_mp2(payload) {
+                        stats.codec = Some(CodecInfo::Audio(mp2));
+                    }
+                }
+                0x81 => {
+                    // AC-3 - can be found directly in payload
+                    if let Some(ac3) = parse_ac3(payload) {
+                        stats.codec = Some(CodecInfo::Audio(ac3));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Handle PES-based parsing for video and AAC
         if stats.codec.is_none() && payload_unit_start && payload.len() >= 6
             && payload.starts_with(&[0x00, 0x00, 0x01])
         {
@@ -410,9 +463,19 @@ fn process_ts_packet(
             if pes_hdr_len < payload.len() {
                 let es_payload = &payload[pes_hdr_len..];
                 match stats.stream_type {
+                    0x02 => {
+                        if let Some(v) = parse_mpeg2_seq_hdr(es_payload) {
+                            stats.codec = Some(CodecInfo::Video(v));
+                        }
+                    }
                     0x1B | 0x24 => {
                         if let Some(v) = parse_h26x_sps(es_payload) {
                             stats.codec = Some(CodecInfo::Video(v));
+                        }
+                    }
+                    0x03 | 0x04 => {
+                        if let Some(mp2) = parse_mp2(es_payload) {
+                            stats.codec = Some(CodecInfo::Audio(mp2));
                         }
                     }
                     0x0F => {
