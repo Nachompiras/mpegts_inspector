@@ -127,7 +127,7 @@ cargo run --release -- --addr 127.0.0.1:8080 --refresh 5  # Local with 5s report
 
 ### **Broadcast Integration API**
 
-#### **Basic Integration (Legacy)**
+#### **Basic Integration**
 ```rust
 use mpegts_inspector::inspector;
 
