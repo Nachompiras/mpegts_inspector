@@ -95,8 +95,8 @@ impl PacketProcessor {
 
         let payload = &chunk[payload_offset..];
 
-        // Only process SI tables if in analysis mode
-        if matches!(analysis_mode, Some(AnalysisMode::Mux) | Some(AnalysisMode::Tr101)) {
+        // Only process SI tables if in analysis mode (any TR-101 level or Mux)
+        if matches!(analysis_mode, Some(AnalysisMode::Mux) | Some(AnalysisMode::Tr101) | Some(AnalysisMode::Tr101Priority1) | Some(AnalysisMode::Tr101Priority12)) {
             self.process_si_tables(pid, payload_unit_start, payload, &mut pat_crc_ok, &mut pmt_crc_ok, &mut cat_crc_ok, &mut nit_crc_ok, &mut sdt_crc_ok, &mut eit_crc_ok, &mut table_id);
             self.process_elementary_streams(pid, payload_unit_start, payload);
         }

@@ -6,12 +6,12 @@ use serde::Serialize;
 
 /// 27 MHz clock: 27 000 000 ticks / second
 const PCR_CLOCK_HZ: f64 = 27_000_000.0;
-/// ±500 ns in PCR ticks  →  27 000 000 * 5e-7  ≈ 13.5
-const PCR_ACCURACY_TICKS: u64 = 27;
-/// Repetition threshold 40 ms
-const PCR_REPETITION_MS: u64 = 100;
+/// ±500 ns in PCR ticks  →  27 000 000 * 500e-9  ≈ 13.5
+const PCR_ACCURACY_TICKS: u64 = 14;
+/// Repetition threshold per TR 101 290: maximum 40 ms
+const PCR_REPETITION_MS: u64 = 40;
 
-const NULL_RATE_THRESHOLD: f64 = 0.15;          // 10 %
+const NULL_RATE_THRESHOLD: f64 = 0.15;          // 15%
 const CAT_TIMEOUT_MS:  u64 = 2000;   // 2 s
 const NIT_TIMEOUT_MS:  u64 = 2000;   // 2 s
 const SDT_TIMEOUT_MS:  u64 = 2000;   // 2 s
@@ -73,12 +73,24 @@ pub struct Tr101Metrics {
     last_tdt_seen:         Option<Instant>,
     #[serde(skip)]
     pub last_splice_value: Option<i8>,
+    #[serde(skip)]
+    startup_time: Option<Instant>,
+    #[serde(skip)]
+    pat_timeout_state: bool,  // Track if PAT is currently in timeout state
+    #[serde(skip)]
+    pmt_timeout_state: HashMap<u16, bool>,  // Track PMT timeout state per PID
+    #[serde(skip)]
+    cat_timeout_state: bool,  // Track if CAT is currently in timeout state
 }
 
 impl Tr101Metrics {
     pub fn new() -> Self {
         Self {
             last_rate_check: None,
+            startup_time: Some(Instant::now()),
+            pat_timeout_state: false,
+            pmt_timeout_state: HashMap::new(),
+            cat_timeout_state: false,
             ..Self::default()
         }
     }
@@ -125,6 +137,10 @@ impl Tr101Metrics {
             last_eit_seen: self.last_eit_seen,
             last_tdt_seen: self.last_tdt_seen,
             last_splice_value: self.last_splice_value,
+            startup_time: self.startup_time,
+            pat_timeout_state: self.pat_timeout_state,
+            pmt_timeout_state: self.pmt_timeout_state.clone(),
+            cat_timeout_state: self.cat_timeout_state,
         }
     }
 
@@ -172,6 +188,10 @@ impl Tr101Metrics {
             last_eit_seen: self.last_eit_seen,
             last_tdt_seen: self.last_tdt_seen,
             last_splice_value: self.last_splice_value,
+            startup_time: self.startup_time,
+            pat_timeout_state: self.pat_timeout_state,
+            pmt_timeout_state: self.pmt_timeout_state.clone(),
+            cat_timeout_state: self.cat_timeout_state,
         }
     }
 
@@ -179,7 +199,7 @@ impl Tr101Metrics {
         &mut self,
         chunk: &[u8],
         pid: u16,
-        payload_unit_start: bool,
+        _payload_unit_start: bool,
         pat_pid: u16,
         is_pat_crc_ok: Option<bool>,
         is_pmt_crc_ok: Option<bool>,
@@ -198,23 +218,35 @@ impl Tr101Metrics {
         /* priority level for selective error reporting */
         priority_level: crate::types::AnalysisMode,
     ) {
+        // Basic packet validation
+        if chunk.len() != 188 {
+            return; // Invalid packet size
+        }
         /* ───── 1.1 sync byte ───── */
         if chunk[0] != 0x47 {
-            self.sync_byte_errors += 1;
+            self.sync_byte_errors = self.sync_byte_errors.saturating_add(1);
             return;
         }
 
         /* ───── 1.2 TEI flag ───── */
         if chunk[1] & 0x80 != 0 {
-            self.transport_error_indicator += 1;
+            self.transport_error_indicator = self.transport_error_indicator.saturating_add(1);
         }
 
         /* ───── 1.4 continuity-counter ───── */
-        let cc = chunk[3] & 0x0F;
-        if let Some(prev) = self.last_cc.insert(pid, cc) {
-            let has_payload = (chunk[3] & 0x10) != 0;
-            if has_payload && ((prev + 1) & 0x0F) != cc {
-                self.continuity_counter_errors += 1;
+        // Skip continuity counter check for null packets (PID 0x1FFF)
+        if pid != 0x1FFF {
+            let cc = chunk[3] & 0x0F;
+            let adaptation_field_control = (chunk[3] & 0x30) >> 4;
+
+            // CC should increment for packets with payload or adaptation field
+            // Only skip CC check for adaptation field only packets (0b10)
+            let should_increment_cc = adaptation_field_control != 0b10;
+
+            if let Some(prev) = self.last_cc.insert(pid, cc) {
+                if should_increment_cc && ((prev + 1) & 0x0F) != cc {
+                    self.continuity_counter_errors = self.continuity_counter_errors.saturating_add(1);
+                }
             }
         }       
 
@@ -222,51 +254,97 @@ impl Tr101Metrics {
         let now = Instant::now();
         if pid == pat_pid {
             if let Some(ok) = is_pat_crc_ok {
-                if !ok { self.pat_crc_errors += 1; }
+                if !ok {
+                    self.pat_crc_errors = self.pat_crc_errors.saturating_add(1);
+                }
             }
             self.last_pat_seen = Some(now);
         } else if let Some(ok) = is_pmt_crc_ok {
-            if !ok { self.pmt_crc_errors += 1; }
+            if !ok {
+                self.pmt_crc_errors = self.pmt_crc_errors.saturating_add(1);
+            }
             self.last_pmt_seen.insert(pid, now);
         }
 
-        /* time-outs */
-        if let Some(last) = self.last_pat_seen {
-            if last.elapsed() > Duration::from_millis(500) {
-                self.pat_timeout += 1;
-                self.last_pat_seen = Some(now);
-            }
+        /* time-outs - increment only on state transitions */
+        let pat_is_timeout = if let Some(last) = self.last_pat_seen {
+            last.elapsed() > Duration::from_millis(500)
+        } else if let Some(start) = self.startup_time {
+            start.elapsed() > Duration::from_millis(500)
+        } else {
+            false
+        };
+
+        // Only increment on transition to timeout state
+        if pat_is_timeout && !self.pat_timeout_state {
+            self.pat_timeout = self.pat_timeout.saturating_add(1);
         }
-        for last in self.last_pmt_seen.values_mut() {
-            if last.elapsed() > Duration::from_secs(1) {
-                self.pmt_timeout += 1;
-                *last = now;
+        self.pat_timeout_state = pat_is_timeout;
+
+        // PMT timeout check - track state per PID
+        for (pmt_pid, last_time) in &self.last_pmt_seen {
+            let is_timeout = last_time.elapsed() > Duration::from_secs(1);
+            let was_timeout = self.pmt_timeout_state.get(pmt_pid).copied().unwrap_or(false);
+
+            // Only increment on transition to timeout
+            if is_timeout && !was_timeout {
+                self.pmt_timeout = self.pmt_timeout.saturating_add(1);
             }
+            self.pmt_timeout_state.insert(*pmt_pid, is_timeout);
         }
 
         /* ───── PCR checks (2.4 / 2.5) - Priority 2 ───── */
         if matches!(priority_level, crate::types::AnalysisMode::Tr101 | crate::types::AnalysisMode::Tr101Priority12) {
             if let Some((base, ext)) = pcr_opt {
-                let pcr_ticks = base * 300 + ext as u64; // full 27 MHz ticks
+                // Validate PCR values are within spec
+                if base > (1u64 << 33) || ext > 299 {
+                    // Invalid PCR values, skip processing
+                    return;
+                }
+
+                // PCR base is in 90kHz units, extension in 27MHz units
+                // Convert to full 27MHz ticks: base * 300 + extension
+                let pcr_ticks = base.saturating_mul(300).saturating_add(ext as u64);
+
                 match self.last_pcr_info.get_mut(&pid) {
                     None => {
                         self.last_pcr_info.insert(pid, (pcr_ticks, now));
                     }
                     Some((prev_ticks, prev_time)) => {
                         let wall_delta = prev_time.elapsed();
-                        let ticks_delta = pcr_ticks.wrapping_sub(*prev_ticks); // handle wrap
 
-                        /* 2.4 repetition */
+                        // Handle PCR wrap-around (33-bit counter wraps every ~26.5 hours)
+                        const PCR_WRAP: u64 = (1u64 << 33) * 300; // PCR wraps at 2^33 in 90kHz units
+                        let ticks_delta = if pcr_ticks >= *prev_ticks {
+                            pcr_ticks - *prev_ticks
+                        } else {
+                            // Handle wrap-around
+                            (PCR_WRAP - *prev_ticks) + pcr_ticks
+                        };
+
+                        /* 2.4 repetition check */
                         if wall_delta.as_millis() as u64 > PCR_REPETITION_MS {
-                            self.pcr_repetition_errors += 1;
+                            self.pcr_repetition_errors = self.pcr_repetition_errors.saturating_add(1);
                         }
 
-                        /* 2.5 accuracy */
-                        let expected_ticks =
-                            (wall_delta.as_secs_f64() * PCR_CLOCK_HZ).round() as i64;
-                        let error = ticks_delta as i64 - expected_ticks;
-                        if error.unsigned_abs() > PCR_ACCURACY_TICKS {
-                            self.pcr_accuracy_errors += 1;
+                        /* 2.5 accuracy check */
+                        // Only check accuracy if wall_delta is reasonable (10ms to 1000ms)
+                        let wall_ms = wall_delta.as_millis() as u64;
+                        if wall_ms >= 10 && wall_ms <= 1000 {
+                            let expected_ticks = (wall_delta.as_secs_f64() * PCR_CLOCK_HZ).round() as u64;
+
+                            // Only check accuracy if ticks_delta is reasonable (avoid wrap-around issues)
+                            if ticks_delta < expected_ticks * 2 {
+                                let error = if ticks_delta > expected_ticks {
+                                    ticks_delta - expected_ticks
+                                } else {
+                                    expected_ticks - ticks_delta
+                                };
+
+                                if error > PCR_ACCURACY_TICKS {
+                                    self.pcr_accuracy_errors = self.pcr_accuracy_errors.saturating_add(1);
+                                }
+                            }
                         }
 
                         /* update state */
@@ -278,22 +356,34 @@ impl Tr101Metrics {
         }
 
         /* ───── null-packet rate counting - Priority 2 ───── */
-        if matches!(priority_level, crate::types::AnalysisMode::Tr101 | crate::types::AnalysisMode::Tr101Priority12) {
-            self.bytes_in_1s += 188;
-            if pid == 0x1FFF { self.null_bytes_in_1s += 188; }
+        // Always count bytes for accurate statistics, but only report errors in Priority 2+
+        self.bytes_in_1s += 188;
+        if pid == 0x1FFF {
+            self.null_bytes_in_1s += 188;
+        }
 
-            let now = Instant::now();
-            if let Some(last_check) = self.last_rate_check {
-                if now.duration_since(last_check) >= Duration::from_secs(1) {
+        // Initialize rate check timestamp if not set
+        if self.last_rate_check.is_none() {
+            self.last_rate_check = Some(now);
+        }
+
+        // Check rate every second
+        if let Some(last_check) = self.last_rate_check {
+            if now.duration_since(last_check) >= Duration::from_secs(1) {
                 if self.bytes_in_1s > 0 {
                     let rate = self.null_bytes_in_1s as f64 / self.bytes_in_1s as f64;
-                    if rate > NULL_RATE_THRESHOLD {
-                        self.null_packet_rate_errors += 1;
+
+                    // Only increment error counter if we're monitoring Priority 2+
+                    if matches!(priority_level, crate::types::AnalysisMode::Tr101 | crate::types::AnalysisMode::Tr101Priority12) {
+                        if rate > NULL_RATE_THRESHOLD {
+                            self.null_packet_rate_errors = self.null_packet_rate_errors.saturating_add(1);
+                        }
                     }
                 }
+
+                // Reset counters and update timestamp
                 self.bytes_in_1s = 0;
-                    self.last_rate_check = Some(now);
-                }
+                self.null_bytes_in_1s = 0;
                 self.last_rate_check = Some(now);
             }
         }
@@ -302,7 +392,9 @@ impl Tr101Metrics {
         if matches!(priority_level, crate::types::AnalysisMode::Tr101 | crate::types::AnalysisMode::Tr101Priority12) {
             if pid == 0x0001 {          // CAT
                 if let Some(ok) = cat_crc_ok {
-                    if !ok { self.cat_crc_errors += 1; }
+                    if !ok {
+                        self.cat_crc_errors = self.cat_crc_errors.saturating_add(1);
+                    }
                 }
                 self.last_cat_seen = Some(now);
             }
@@ -332,11 +424,19 @@ impl Tr101Metrics {
 
         /* ───── CAT timeout - Priority 2 ───── */
         if matches!(priority_level, crate::types::AnalysisMode::Tr101 | crate::types::AnalysisMode::Tr101Priority12) {
-            if self.last_cat_seen.map_or(true, |t| t.elapsed()
-                    > Duration::from_millis(CAT_TIMEOUT_MS)) {
-                self.cat_timeout += 1;
-                self.last_cat_seen = Some(now);
+            let cat_is_timeout = if let Some(last_cat) = self.last_cat_seen {
+                last_cat.elapsed() > Duration::from_millis(CAT_TIMEOUT_MS)
+            } else if let Some(start) = self.startup_time {
+                start.elapsed() > Duration::from_millis(CAT_TIMEOUT_MS)
+            } else {
+                false
+            };
+
+            // Only increment on transition to timeout state
+            if cat_is_timeout && !self.cat_timeout_state {
+                self.cat_timeout = self.cat_timeout.saturating_add(1);
             }
+            self.cat_timeout_state = cat_is_timeout;
         }
 
         /* ───── NIT/SDT/EIT/TDT timeouts - Priority 3 ───── */
