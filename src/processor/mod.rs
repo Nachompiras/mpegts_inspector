@@ -51,14 +51,30 @@ impl PacketProcessor {
 
     /// Process a single TS packet
     pub fn process_packet(&mut self, chunk: &[u8], analysis_mode: Option<AnalysisMode>) {
-        if chunk.len() < 188 || chunk[0] != 0x47 {
+        // Check packet length
+        if chunk.len() < 188 {
             return; // Invalid packet
+        }
+
+        // Check sync byte and detect sync loss
+        let sync_byte_valid = chunk[0] == 0x47;
+        if let Some(ref mut tr101) = self.tr101 {
+            tr101.check_ts_sync_loss(sync_byte_valid, analysis_mode.unwrap_or(AnalysisMode::None));
+        }
+
+        if !sync_byte_valid {
+            return; // Invalid sync byte
         }
 
         let pid = (((chunk[1] & 0x1F) as u16) << 8) | (chunk[2] as u16);
         let payload_unit_start = chunk[1] & 0x40 != 0;
         let adaption_field_ctrl = (chunk[3] & 0x30) >> 4;
         let mut payload_offset = 4usize;
+
+        // Check for PID errors (unexpected/undeclared PIDs)
+        if let Some(ref mut tr101) = self.tr101 {
+            tr101.check_pid_error(pid, analysis_mode.unwrap_or(AnalysisMode::None));
+        }
 
         // State variables for TR-101 reporting
         let mut pat_crc_ok: Option<bool> = None;
@@ -107,7 +123,7 @@ impl PacketProcessor {
         // Only process SI tables if in analysis mode (any TR-101 level or Mux)
         if matches!(analysis_mode, Some(AnalysisMode::Mux) | Some(AnalysisMode::Tr101) | Some(AnalysisMode::Tr101Priority1) | Some(AnalysisMode::Tr101Priority12)) {
             self.process_si_tables(pid, payload_unit_start, payload, &mut pat_crc_ok, &mut pmt_crc_ok, &mut cat_crc_ok, &mut nit_crc_ok, &mut sdt_crc_ok, &mut eit_crc_ok, &mut tdt_crc_ok, &mut table_id, analysis_mode);
-            self.process_elementary_streams(pid, payload_unit_start, payload);
+            self.process_elementary_streams(pid, payload_unit_start, payload, analysis_mode);
         }
 
         // TR-101 analysis if enabled
@@ -237,6 +253,12 @@ impl PacketProcessor {
                         // Check for PMT version changes (Priority 2)
                         if let Some(ref mut tr101) = self.tr101 {
                             tr101.check_pmt_version_change(pid, pmt.version, analysis_mode.unwrap_or(AnalysisMode::None));
+
+                            // Register all PIDs in this PMT as known/authorized
+                            tr101.register_known_pid(pmt.pcr_pid); // Register PCR PID
+                            for stream in &pmt.streams {
+                                tr101.register_known_pid(stream.elementary_pid); // Register elementary stream PIDs
+                            }
                         }
 
                         // Extract and store PCR PID for this program
@@ -298,11 +320,11 @@ impl PacketProcessor {
         }
     }
 
-    fn process_elementary_streams(&mut self, pid: u16, payload_unit_start: bool, payload: &[u8]) {
+    fn process_elementary_streams(&mut self, pid: u16, payload_unit_start: bool, payload: &[u8], analysis_mode: Option<AnalysisMode>) {
         // Update byte counts for existing streams
         if self.stats_manager.contains_pid(pid) {
             self.stats_manager.update_bytes(pid, 188);
-            self.parse_codec_info(pid, payload_unit_start, payload);
+            self.parse_codec_info(pid, payload_unit_start, payload, analysis_mode);
         } else if payload_unit_start {
             // Check if this PID is an elementary stream from any PMT
             if let Some((_, pmt)) = self.pmt_map
@@ -321,7 +343,7 @@ impl PacketProcessor {
         }
     }
 
-    fn parse_codec_info(&mut self, pid: u16, payload_unit_start: bool, payload: &[u8]) {
+    fn parse_codec_info(&mut self, pid: u16, payload_unit_start: bool, payload: &[u8], analysis_mode: Option<AnalysisMode>) {
         let Some(stats) = self.stats_manager.get(pid) else { return };
 
         if stats.codec.is_some() {
@@ -383,10 +405,10 @@ impl PacketProcessor {
         }
 
         // FPS calculation by PTS for video streams
-        self.calculate_fps_from_pts(pid, payload_unit_start, payload);
+        self.calculate_fps_from_pts(pid, payload_unit_start, payload, analysis_mode);
     }
 
-    fn calculate_fps_from_pts(&mut self, pid: u16, payload_unit_start: bool, payload: &[u8]) {
+    fn calculate_fps_from_pts(&mut self, pid: u16, payload_unit_start: bool, payload: &[u8], analysis_mode: Option<AnalysisMode>) {
         if !payload_unit_start || payload.len() <= 14 || !payload.starts_with(&[0x00, 0x00, 0x01]) {
             return;
         }
@@ -450,6 +472,11 @@ impl PacketProcessor {
                     }
                 }
             }
+            // Check for PTS errors (Priority 2)
+            if let Some(ref mut tr101) = self.tr101 {
+                tr101.check_pts_error(pid, pts, analysis_mode.unwrap_or(AnalysisMode::None));
+            }
+
             stats.last_pts = Some(pts);
         }
     }

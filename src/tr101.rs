@@ -22,12 +22,14 @@ const TDT_TIMEOUT_MS:  u64 = 2000;   // 2 s
 pub struct Tr101Metrics {
     // Priority-1 counters
     pub sync_byte_errors:            u64, // 1.1
+    pub ts_sync_loss:                u64, // 1.1b (TS synchronization loss)
     pub transport_error_indicator:   u64, // 1.2
     pub pat_crc_errors:              u64, // 1.3a
     pub pat_timeout:                 u64, // 1.3b
     pub continuity_counter_errors:   u64, // 1.4
     pub pmt_crc_errors:              u64, // 1.5a
     pub pmt_timeout:                 u64, // 1.5b
+    pub pid_errors:                  u64, // 1.6 (unreferenced/unexpected PIDs)
 
     /* ───────── Priority-2 (new) ───────── */
     pub pcr_repetition_errors:       u64, // 2.4
@@ -37,6 +39,7 @@ pub struct Tr101Metrics {
     pub cat_timeout:                u64, // 2.7b
     pub pat_version_changes:         u64, // 2.8 (version change detection)
     pub pmt_version_changes:         u64, // 2.9 (version change detection)
+    pub pts_errors:                  u64, // 2.10 (PTS discontinuity/errors)
  
      /* Priority-3 */
      pub service_id_mismatch:        u64, // 3.2-d
@@ -87,6 +90,12 @@ pub struct Tr101Metrics {
     pmt_timeout_state: HashMap<u16, bool>,  // Track PMT timeout state per PID
     #[serde(skip)]
     cat_timeout_state: bool,  // Track if CAT is currently in timeout state
+    #[serde(skip)]
+    known_pids: std::collections::HashSet<u16>,  // PIDs that are authorized/expected
+    #[serde(skip)]
+    last_pts_per_pid: HashMap<u16, u64>,  // Track last PTS per PID for discontinuity detection
+    #[serde(skip)]
+    sync_loss_counter: u64,  // Track consecutive sync loss occurrences
 }
 
 impl Tr101Metrics {
@@ -106,12 +115,14 @@ impl Tr101Metrics {
         Self {
             // Priority 1 errors
             sync_byte_errors: self.sync_byte_errors,
+            ts_sync_loss: self.ts_sync_loss,
             transport_error_indicator: self.transport_error_indicator,
             pat_crc_errors: self.pat_crc_errors,
             pat_timeout: self.pat_timeout,
             continuity_counter_errors: self.continuity_counter_errors,
             pmt_crc_errors: self.pmt_crc_errors,
             pmt_timeout: self.pmt_timeout,
+            pid_errors: self.pid_errors,
 
             // Zero out Priority 2 and 3
             pcr_repetition_errors: 0,
@@ -121,6 +132,7 @@ impl Tr101Metrics {
             cat_timeout: 0,
             pat_version_changes: 0,
             pmt_version_changes: 0,
+            pts_errors: 0,
             service_id_mismatch: 0,
             nit_crc_errors: 0,
             nit_timeout: 0,
@@ -151,6 +163,9 @@ impl Tr101Metrics {
             pat_timeout_state: self.pat_timeout_state,
             pmt_timeout_state: self.pmt_timeout_state.clone(),
             cat_timeout_state: self.cat_timeout_state,
+            known_pids: self.known_pids.clone(),
+            last_pts_per_pid: self.last_pts_per_pid.clone(),
+            sync_loss_counter: self.sync_loss_counter,
         }
     }
 
@@ -159,12 +174,14 @@ impl Tr101Metrics {
         Self {
             // Priority 1 errors
             sync_byte_errors: self.sync_byte_errors,
+            ts_sync_loss: self.ts_sync_loss,
             transport_error_indicator: self.transport_error_indicator,
             pat_crc_errors: self.pat_crc_errors,
             pat_timeout: self.pat_timeout,
             continuity_counter_errors: self.continuity_counter_errors,
             pmt_crc_errors: self.pmt_crc_errors,
             pmt_timeout: self.pmt_timeout,
+            pid_errors: self.pid_errors,
 
             // Priority 2 errors
             pcr_repetition_errors: self.pcr_repetition_errors,
@@ -174,6 +191,7 @@ impl Tr101Metrics {
             cat_timeout: self.cat_timeout,
             pat_version_changes: self.pat_version_changes,
             pmt_version_changes: self.pmt_version_changes,
+            pts_errors: self.pts_errors,
 
             // Zero out Priority 3
             service_id_mismatch: 0,
@@ -206,6 +224,9 @@ impl Tr101Metrics {
             pat_timeout_state: self.pat_timeout_state,
             pmt_timeout_state: self.pmt_timeout_state.clone(),
             cat_timeout_state: self.cat_timeout_state,
+            known_pids: self.known_pids.clone(),
+            last_pts_per_pid: self.last_pts_per_pid.clone(),
+            sync_loss_counter: self.sync_loss_counter,
         }
     }
 
@@ -520,5 +541,91 @@ impl Tr101Metrics {
                 false
             }
         }
+    }
+
+    /// Check for TS sync loss (Priority 1)
+    pub fn check_ts_sync_loss(&mut self, sync_byte_valid: bool, priority_level: crate::types::AnalysisMode) {
+        if !matches!(priority_level, crate::types::AnalysisMode::Tr101 | crate::types::AnalysisMode::Tr101Priority12 | crate::types::AnalysisMode::Tr101Priority1) {
+            return;
+        }
+
+        if sync_byte_valid {
+            // Reset sync loss counter on valid sync
+            self.sync_loss_counter = 0;
+        } else {
+            // Increment sync loss counter
+            self.sync_loss_counter = self.sync_loss_counter.saturating_add(1);
+
+            // After consecutive sync losses, count as TS sync loss
+            if self.sync_loss_counter >= 5 {
+                self.ts_sync_loss = self.ts_sync_loss.saturating_add(1);
+            }
+        }
+    }
+
+    /// Check for PID errors (Priority 1)
+    pub fn check_pid_error(&mut self, pid: u16, priority_level: crate::types::AnalysisMode) {
+        if !matches!(priority_level, crate::types::AnalysisMode::Tr101 | crate::types::AnalysisMode::Tr101Priority12 | crate::types::AnalysisMode::Tr101Priority1) {
+            return;
+        }
+
+        // System PIDs that are always allowed
+        const SYSTEM_PIDS: &[u16] = &[
+            0x0000, // PAT
+            0x0001, // CAT
+            0x0010, // NIT
+            0x0011, // SDT/BAT/EIT
+            0x0012, // EIT
+            0x0013, // RST/ST
+            0x0014, // TDT/TOT
+            0x1FFF, // Null packets
+        ];
+
+        // Allow system PIDs
+        if SYSTEM_PIDS.contains(&pid) {
+            self.known_pids.insert(pid);
+            return;
+        }
+
+        // Check if this PID was declared in PMT or is known
+        if !self.known_pids.contains(&pid) {
+            self.pid_errors = self.pid_errors.saturating_add(1);
+        }
+    }
+
+    /// Register a PID as known/authorized (called from PMT processing)
+    pub fn register_known_pid(&mut self, pid: u16) {
+        self.known_pids.insert(pid);
+    }
+
+    /// Check for PTS errors (Priority 2)
+    pub fn check_pts_error(&mut self, pid: u16, pts: u64, priority_level: crate::types::AnalysisMode) {
+        if !matches!(priority_level, crate::types::AnalysisMode::Tr101 | crate::types::AnalysisMode::Tr101Priority12) {
+            return;
+        }
+
+        if let Some(&last_pts) = self.last_pts_per_pid.get(&pid) {
+            // Check for PTS discontinuity (backward jump or too large forward jump)
+            const MAX_PTS_JUMP: u64 = 90000 * 5; // 5 seconds at 90kHz
+
+            if pts < last_pts {
+                // Backward PTS jump (unless it's a wrap-around)
+                const PTS_WRAP: u64 = 1u64 << 33; // 33-bit PTS counter
+                let pts_diff = last_pts - pts;
+
+                // If the difference is large, it might be a wrap-around
+                if pts_diff < PTS_WRAP / 2 {
+                    self.pts_errors = self.pts_errors.saturating_add(1);
+                }
+            } else {
+                let pts_diff = pts - last_pts;
+                // Check for too large forward jump
+                if pts_diff > MAX_PTS_JUMP {
+                    self.pts_errors = self.pts_errors.saturating_add(1);
+                }
+            }
+        }
+
+        self.last_pts_per_pid.insert(pid, pts);
     }
 }
