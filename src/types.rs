@@ -48,6 +48,12 @@ pub struct StreamInfo {
 pub struct ProgramInfo {
     pub program_number: u16,
     pub streams: Vec<StreamInfo>,
+    /// PCR PID for this program (from PMT)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pcr_pid: Option<u16>,
+    /// PMT version for change tracking
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pmt_version: Option<u8>,
 }
 
 /// Complete inspection report with all discovered programs and TR-101 metrics

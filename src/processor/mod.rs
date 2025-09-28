@@ -4,13 +4,16 @@ use std::collections::HashMap;
 use crate::types::{CodecInfo, SubtitleInfo, AnalysisMode};
 use crate::stats::StatsManager;
 use crate::parsers::{parse_video_codec, parse_audio_codec};
-use crate::psi::{parse_pat, parse_pmt, parse_cat, parse_nit, parse_sdt, parse_eit_pf, PatSection, PmtSection};
+use crate::psi::{parse_pat, parse_pmt, parse_cat, parse_nit, parse_sdt, parse_eit_pf, parse_tdt_tot, PatSection, PmtSection};
 use crate::si_cache::SiCache;
 use crate::tr101::Tr101Metrics;
 
 pub struct PacketProcessor {
     pub pat_map: HashMap<u16, PatSection>,
     pub pmt_map: HashMap<u16, PmtSection>,
+    pub pcr_pid_map: HashMap<u16, u16>, // program_number -> pcr_pid
+    pub pat_versions: HashMap<u16, u8>, // program_number -> version
+    pub pmt_versions: HashMap<u16, u8>, // pmt_pid -> version
     pub stats_manager: StatsManager,
     pub si_cache: SiCache,
     pub tr101: Option<Tr101Metrics>,
@@ -21,6 +24,9 @@ impl PacketProcessor {
         Self {
             pat_map: HashMap::new(),
             pmt_map: HashMap::new(),
+            pcr_pid_map: HashMap::new(),
+            pat_versions: HashMap::new(),
+            pmt_versions: HashMap::new(),
             stats_manager: StatsManager::new(),
             si_cache: SiCache::default(),
             tr101: if enable_tr101 { Some(Tr101Metrics::new()) } else { None },
@@ -61,6 +67,7 @@ impl PacketProcessor {
         let mut nit_crc_ok: Option<bool> = None;
         let mut sdt_crc_ok: Option<bool> = None;
         let mut eit_crc_ok: Option<bool> = None;
+        let mut tdt_crc_ok: Option<bool> = None;
         let mut table_id: u8 = 0xFF;
 
         // Skip packets with no payload or adaptation field only
@@ -77,9 +84,11 @@ impl PacketProcessor {
             }
         }
 
-        // Extract PCR if present
+        // Extract PCR if present and this PID is a designated PCR PID
         let mut pcr_found: Option<(u64, u16)> = None;
-        if adaption_field_ctrl & 0x02 != 0 && payload_offset > 4 {
+        let is_pcr_pid = self.pcr_pid_map.values().any(|&pcr_pid| pcr_pid == pid);
+
+        if adaption_field_ctrl & 0x02 != 0 && payload_offset > 4 && is_pcr_pid {
             let ad_len = chunk[4] as usize;
             if ad_len >= 7 && chunk[5] & 0x10 != 0 { // PCR_flag
                 let p = &chunk[6..12];
@@ -97,7 +106,7 @@ impl PacketProcessor {
 
         // Only process SI tables if in analysis mode (any TR-101 level or Mux)
         if matches!(analysis_mode, Some(AnalysisMode::Mux) | Some(AnalysisMode::Tr101) | Some(AnalysisMode::Tr101Priority1) | Some(AnalysisMode::Tr101Priority12)) {
-            self.process_si_tables(pid, payload_unit_start, payload, &mut pat_crc_ok, &mut pmt_crc_ok, &mut cat_crc_ok, &mut nit_crc_ok, &mut sdt_crc_ok, &mut eit_crc_ok, &mut table_id);
+            self.process_si_tables(pid, payload_unit_start, payload, &mut pat_crc_ok, &mut pmt_crc_ok, &mut cat_crc_ok, &mut nit_crc_ok, &mut sdt_crc_ok, &mut eit_crc_ok, &mut tdt_crc_ok, &mut table_id, analysis_mode);
             self.process_elementary_streams(pid, payload_unit_start, payload);
         }
 
@@ -165,13 +174,23 @@ impl PacketProcessor {
         nit_crc_ok: &mut Option<bool>,
         sdt_crc_ok: &mut Option<bool>,
         eit_crc_ok: &mut Option<bool>,
+        tdt_crc_ok: &mut Option<bool>,
         table_id: &mut u8,
+        analysis_mode: Option<AnalysisMode>,
     ) {
         // PAT (PID 0x0000)
         if pid == 0x0000 && payload_unit_start {
             match parse_pat(payload) {
                 Ok(pat) => {
                     *pat_crc_ok = Some(true);
+
+                    // Check for PAT version changes (Priority 2)
+                    if let Some(ref mut tr101) = self.tr101 {
+                        for entry in &pat.programs {
+                            tr101.check_pat_version_change(entry.program_number, pat.version, analysis_mode.unwrap_or(AnalysisMode::None));
+                        }
+                    }
+
                     self.si_cache.update_pat(pat.clone());
                     for entry in &pat.programs {
                         self.pat_map.insert(entry.program_number, pat.clone());
@@ -214,6 +233,19 @@ impl PacketProcessor {
                 match parse_pmt(payload) {
                     Ok(pmt) => {
                         *pmt_crc_ok = Some(true);
+
+                        // Check for PMT version changes (Priority 2)
+                        if let Some(ref mut tr101) = self.tr101 {
+                            tr101.check_pmt_version_change(pid, pmt.version, analysis_mode.unwrap_or(AnalysisMode::None));
+                        }
+
+                        // Extract and store PCR PID for this program
+                        if let Some((_prog_num, _pat)) = self.pat_map.iter().find(|(_, p)| p.programs.iter().any(|e| e.pmt_pid == pid)) {
+                            if let Some(pat_entry) = _pat.programs.iter().find(|e| e.pmt_pid == pid) {
+                                self.pcr_pid_map.insert(pat_entry.program_number, pmt.pcr_pid);
+                            }
+                        }
+
                         self.si_cache.update_pmt(pid, pmt.clone());
                         self.pmt_map.insert(pid, pmt.clone());
                     }
@@ -241,6 +273,26 @@ impl PacketProcessor {
                         *table_id = tid;
                     }
                     Err(_) => { /* may be TOT/TDT or CRC error → ignore */ }
+                }
+            }
+        }
+
+        // TDT/TOT (PID 0x0014)
+        if pid == 0x0014 && payload_unit_start {
+            match parse_tdt_tot(payload) {
+                Ok((tid, _tdt_tot)) => {
+                    *table_id = tid;
+                    // TDT (0x70) has no CRC, TOT (0x73) has CRC
+                    if tid == 0x73 {
+                        *tdt_crc_ok = Some(true);  // TOT CRC was validated successfully
+                    }
+                    // For TDT, we don't set tdt_crc_ok since it has no CRC
+                }
+                Err(_) => {
+                    // If it's a TOT (should have CRC), mark as CRC error
+                    // We can't easily determine if it was supposed to be TOT vs TDT here,
+                    // so we conservatively assume CRC error only if parse failed
+                    *tdt_crc_ok = Some(false);
                 }
             }
         }
@@ -405,6 +457,16 @@ impl PacketProcessor {
     /// Clean up old/inactive streams
     pub fn cleanup_old_streams(&mut self, timeout_secs: u64) {
         self.stats_manager.cleanup_old_streams(std::time::Duration::from_secs(timeout_secs));
+    }
+
+    /// Get PCR PID for a specific program number
+    pub fn get_pcr_pid(&self, program_number: u16) -> Option<u16> {
+        self.pcr_pid_map.get(&program_number).copied()
+    }
+
+    /// Get PMT version for a specific PMT PID
+    pub fn get_pmt_version(&self, pmt_pid: u16) -> Option<u8> {
+        self.pmt_map.get(&pmt_pid).map(|pmt| pmt.version)
     }
 
     /// Get TR-101 metrics reference

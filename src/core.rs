@@ -37,9 +37,7 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
             processor.cleanup_old_streams(30);
 
             let json = Reporter::generate_json_report(
-                &processor.pat_map,
-                &processor.pmt_map,
-                &processor.stats_manager,
+                &processor,
                 processor.get_tr101_metrics(),
                 opts.analysis_mode,
             );
@@ -77,9 +75,7 @@ where
             processor.cleanup_old_streams(30);
 
             let report = Reporter::create_report(
-                &processor.pat_map,
-                &processor.pmt_map,
-                &processor.stats_manager,
+                &processor,
                 processor.get_tr101_metrics(),
                 analysis_mode,
             );
@@ -155,9 +151,7 @@ pub async fn run_broadcast_with_control(
             processor.cleanup_old_streams(30);
 
             let json = Reporter::generate_json_report(
-                &processor.pat_map,
-                &processor.pmt_map,
-                &processor.stats_manager,
+                &processor,
                 processor.get_tr101_metrics(),
                 current_mode,
             );

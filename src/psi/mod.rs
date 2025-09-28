@@ -9,7 +9,7 @@ pub mod pmt;
 
 pub use nit::parse_nit;
 pub use eit::parse_eit_pf;
-// pub use tdt::parse_tdt_tot;  // Currently unused
+pub use tdt::parse_tdt_tot;
 pub use sdt::parse_sdt;
 pub use cat::parse_cat;
 // pub use cat::CatSection;  // Currently unused

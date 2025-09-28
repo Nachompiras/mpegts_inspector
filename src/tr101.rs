@@ -31,10 +31,12 @@ pub struct Tr101Metrics {
 
     /* ───────── Priority-2 (new) ───────── */
     pub pcr_repetition_errors:       u64, // 2.4
-    pub pcr_accuracy_errors:         u64, // 2.5     
+    pub pcr_accuracy_errors:         u64, // 2.5
     pub null_packet_rate_errors:    u64, // 2.6
     pub cat_crc_errors:             u64, // 2.7a
     pub cat_timeout:                u64, // 2.7b
+    pub pat_version_changes:         u64, // 2.8 (version change detection)
+    pub pmt_version_changes:         u64, // 2.9 (version change detection)
  
      /* Priority-3 */
      pub service_id_mismatch:        u64, // 3.2-d
@@ -53,6 +55,10 @@ pub struct Tr101Metrics {
     #[serde(skip)]
     last_pmt_seen: HashMap<u16, Instant>, // pmt_pid → last time seen
     last_cc: HashMap<u16, u8>,            // pid → last continuity counter
+    #[serde(skip)]
+    pat_versions: HashMap<u16, u8>,       // program_number → last version
+    #[serde(skip)]
+    pmt_versions: HashMap<u16, u8>,       // pmt_pid → last version
     #[serde(skip)]
     last_pcr_info: HashMap<u16, (u64, Instant)>, // pid → (pcr_ticks, wallclock)
     #[serde(skip)]
@@ -113,6 +119,8 @@ impl Tr101Metrics {
             null_packet_rate_errors: 0,
             cat_crc_errors: 0,
             cat_timeout: 0,
+            pat_version_changes: 0,
+            pmt_version_changes: 0,
             service_id_mismatch: 0,
             nit_crc_errors: 0,
             nit_timeout: 0,
@@ -127,6 +135,8 @@ impl Tr101Metrics {
             last_pat_seen: self.last_pat_seen,
             last_pmt_seen: self.last_pmt_seen.clone(),
             last_cc: self.last_cc.clone(),
+            pat_versions: self.pat_versions.clone(),
+            pmt_versions: self.pmt_versions.clone(),
             last_pcr_info: self.last_pcr_info.clone(),
             bytes_in_1s: self.bytes_in_1s,
             null_bytes_in_1s: self.null_bytes_in_1s,
@@ -162,6 +172,8 @@ impl Tr101Metrics {
             null_packet_rate_errors: self.null_packet_rate_errors,
             cat_crc_errors: self.cat_crc_errors,
             cat_timeout: self.cat_timeout,
+            pat_version_changes: self.pat_version_changes,
+            pmt_version_changes: self.pmt_version_changes,
 
             // Zero out Priority 3
             service_id_mismatch: 0,
@@ -178,6 +190,8 @@ impl Tr101Metrics {
             last_pat_seen: self.last_pat_seen,
             last_pmt_seen: self.last_pmt_seen.clone(),
             last_cc: self.last_cc.clone(),
+            pat_versions: self.pat_versions.clone(),
+            pmt_versions: self.pmt_versions.clone(),
             last_pcr_info: self.last_pcr_info.clone(),
             bytes_in_1s: self.bytes_in_1s,
             null_bytes_in_1s: self.null_bytes_in_1s,
@@ -456,6 +470,54 @@ impl Tr101Metrics {
                     > Duration::from_millis(TDT_TIMEOUT_MS)) {
                 self.tdt_timeout += 1;
                 self.last_tdt_seen = Some(now);
+            }
+        }
+    }
+
+    /// Check for PAT version change (Priority 2)
+    pub fn check_pat_version_change(&mut self, program_number: u16, new_version: u8, priority_level: crate::types::AnalysisMode) -> bool {
+        if !matches!(priority_level, crate::types::AnalysisMode::Tr101 | crate::types::AnalysisMode::Tr101Priority12) {
+            return false;
+        }
+
+        match self.pat_versions.get(&program_number) {
+            Some(&old_version) => {
+                if old_version != new_version {
+                    self.pat_version_changes = self.pat_version_changes.saturating_add(1);
+                    self.pat_versions.insert(program_number, new_version);
+                    true
+                } else {
+                    false
+                }
+            }
+            None => {
+                // First time seeing this program, store version
+                self.pat_versions.insert(program_number, new_version);
+                false
+            }
+        }
+    }
+
+    /// Check for PMT version change (Priority 2)
+    pub fn check_pmt_version_change(&mut self, pmt_pid: u16, new_version: u8, priority_level: crate::types::AnalysisMode) -> bool {
+        if !matches!(priority_level, crate::types::AnalysisMode::Tr101 | crate::types::AnalysisMode::Tr101Priority12) {
+            return false;
+        }
+
+        match self.pmt_versions.get(&pmt_pid) {
+            Some(&old_version) => {
+                if old_version != new_version {
+                    self.pmt_version_changes = self.pmt_version_changes.saturating_add(1);
+                    self.pmt_versions.insert(pmt_pid, new_version);
+                    true
+                } else {
+                    false
+                }
+            }
+            None => {
+                // First time seeing this PMT, store version
+                self.pmt_versions.insert(pmt_pid, new_version);
+                false
             }
         }
     }

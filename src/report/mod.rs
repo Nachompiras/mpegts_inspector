@@ -33,6 +33,10 @@ struct EsJson<'a> {
 struct ProgramJson<'a> {
     program: u16,
     streams: Vec<EsJson<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pcr_pid: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pmt_version: Option<u8>,
 }
 
 /// JSON structure for complete report (internal serialization)
@@ -49,25 +53,23 @@ pub struct Reporter;
 impl Reporter {
     /// Generate a structured InspectorReport for API consumers
     pub fn create_report(
-        pat_map: &HashMap<u16, PatSection>,
-        pmt_map: &HashMap<u16, PmtSection>,
-        stats_manager: &StatsManager,
+        processor: &crate::processor::PacketProcessor,
         tr101: Tr101Metrics,
         analysis_mode: Option<crate::types::AnalysisMode>,
     ) -> InspectorReport {
         let mut programs = Vec::new();
 
-        for (prog_num, pat) in pat_map {
+        for (prog_num, pat) in &processor.pat_map {
             if let Some(pmt_pid) = pat.programs
                 .iter()
                 .find(|p| p.program_number == *prog_num)
                 .map(|p| p.pmt_pid)
             {
-                if let Some(pmt) = pmt_map.get(&pmt_pid) {
+                if let Some(pmt) = processor.pmt_map.get(&pmt_pid) {
                     let mut streams = Vec::new();
                     for s in &pmt.streams {
-                        if let Some(stats) = stats_manager.get(s.elementary_pid) {
-                            if let Some(bitrate_kbps) = stats_manager.calculate_bitrate(s.elementary_pid) {
+                        if let Some(stats) = processor.stats_manager.get(s.elementary_pid) {
+                            if let Some(bitrate_kbps) = processor.stats_manager.calculate_bitrate(s.elementary_pid) {
                                 streams.push(StreamInfo {
                                     pid: s.elementary_pid,
                                     stream_type: s.stream_type,
@@ -77,9 +79,15 @@ impl Reporter {
                             }
                         }
                     }
+                    // Get PCR PID and PMT version for this program
+                    let pcr_pid = processor.get_pcr_pid(*prog_num);
+                    let pmt_version = processor.get_pmt_version(pmt_pid);
+
                     programs.push(ProgramInfo {
                         program_number: *prog_num,
                         streams,
+                        pcr_pid,
+                        pmt_version,
                     });
                 }
             }
@@ -101,25 +109,23 @@ impl Reporter {
 
     /// Generate pretty-printed JSON string for CLI output
     pub fn generate_json_report(
-        pat_map: &HashMap<u16, PatSection>,
-        pmt_map: &HashMap<u16, PmtSection>,
-        stats_manager: &StatsManager,
+        processor: &crate::processor::PacketProcessor,
         tr101: Tr101Metrics,
         analysis_mode: Option<crate::types::AnalysisMode>,
     ) -> String {
         let mut programs_out = Vec::new();
 
-        for (prog_num, pat) in pat_map {
+        for (prog_num, pat) in &processor.pat_map {
             if let Some(pmt_pid) = pat.programs
                 .iter()
                 .find(|p| p.program_number == *prog_num)
                 .map(|p| p.pmt_pid)
             {
-                if let Some(pmt) = pmt_map.get(&pmt_pid) {
+                if let Some(pmt) = processor.pmt_map.get(&pmt_pid) {
                     let mut es_vec = Vec::new();
                     for s in &pmt.streams {
-                        if let Some(stats) = stats_manager.get(s.elementary_pid) {
-                            if let Some(bitrate_kbps) = stats_manager.calculate_bitrate(s.elementary_pid) {
+                        if let Some(stats) = processor.stats_manager.get(s.elementary_pid) {
+                            if let Some(bitrate_kbps) = processor.stats_manager.calculate_bitrate(s.elementary_pid) {
                                 match &stats.codec {
                                     Some(CodecInfo::Video(v)) => es_vec.push(EsJson {
                                         pid: s.elementary_pid,
@@ -164,9 +170,15 @@ impl Reporter {
                             }
                         }
                     }
+                    // Get PCR PID and PMT version for this program
+                    let pcr_pid = processor.get_pcr_pid(*prog_num);
+                    let pmt_version = processor.get_pmt_version(pmt_pid);
+
                     programs_out.push(ProgramJson {
                         program: *prog_num,
                         streams: es_vec,
+                        pcr_pid,
+                        pmt_version,
                     });
                 }
             }
