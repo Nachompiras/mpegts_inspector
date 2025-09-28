@@ -21,8 +21,8 @@ pub fn parse_sdt(payload: &[u8]) -> anyhow::Result<(u8, SdtSection)> {
     }
 
     // Fixed header inside SDT body
-    let transport_stream_id = u16::from_be_bytes([b[0], b[1]]);
-    let original_net_id     = u16::from_be_bytes([b[6], b[7]]);
+    let _transport_stream_id = u16::from_be_bytes([b[0], b[1]]);
+    let _original_net_id     = u16::from_be_bytes([b[6], b[7]]);
     // We don’t need them now, but kept for completeness
 
     let mut idx = 8;                              // start of service loop

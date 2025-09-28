@@ -15,7 +15,7 @@ pub fn parse_tdt_tot(payload: &[u8]) -> anyhow::Result<(u8, TdtTot)> {
     if payload.len() < start + 3 { bail!("short TDT/TOT"); }
 
     let tid      = payload[start];
-    let sec_len  = ((payload[start+1] & 0x0F) as usize) << 8 | payload[start+2] as usize;
+    let sec_len  = (((payload[start+1] & 0x0F) as usize) << 8) | (payload[start+2] as usize);
     let end      = start + 3 + sec_len;
     if end > payload.len() { bail!("truncated"); }
 

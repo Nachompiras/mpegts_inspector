@@ -49,7 +49,7 @@ impl PacketProcessor {
             return; // Invalid packet
         }
 
-        let pid = ((chunk[1] & 0x1F) as u16) << 8 | chunk[2] as u16;
+        let pid = (((chunk[1] & 0x1F) as u16) << 8) | (chunk[2] as u16);
         let payload_unit_start = chunk[1] & 0x40 != 0;
         let adaption_field_ctrl = (chunk[3] & 0x30) >> 4;
         let mut payload_offset = 4usize;
@@ -88,7 +88,7 @@ impl PacketProcessor {
                         | ((p[2] as u64) << 9)
                         | ((p[3] as u64) << 1)
                         | ((p[4] as u64) >> 7);
-                let ext = ((p[4] & 0x01) as u16) << 8 | p[5] as u16;
+                let ext = (((p[4] & 0x01) as u16) << 8) | (p[5] as u16);
                 pcr_found = Some((base, ext));
             }
         }
@@ -105,32 +105,28 @@ impl PacketProcessor {
         if matches!(analysis_mode, Some(AnalysisMode::Tr101) | Some(AnalysisMode::Tr101Priority1) | Some(AnalysisMode::Tr101Priority12)) {
             if let Some(ref mut tr101) = self.tr101 {
                 // Check for service ID mismatch - Priority 3
-                if matches!(analysis_mode, Some(AnalysisMode::Tr101)) {
-                    if self.si_cache.check_service_id_mismatch() {
-                        tr101.service_id_mismatch += 1;
-                    }
+                if matches!(analysis_mode, Some(AnalysisMode::Tr101)) && self.si_cache.check_service_id_mismatch() {
+                    tr101.service_id_mismatch += 1;
                 }
 
                 // Handle splice_countdown in adaptation field - Priority 3
-                if matches!(analysis_mode, Some(AnalysisMode::Tr101)) {
-                    if adaption_field_ctrl & 0x02 != 0 && payload_offset > 4 {
-                        let ad_len = chunk[4] as usize;
-                        if ad_len >= 1 {
-                            let flags = chunk[5];
-                            if flags & 0x04 != 0 {
-                                // splice_countdown present
-                                let sc_pos = 6 + ad_len - 1;
-                                if sc_pos < chunk.len() {
-                                    let val = chunk[sc_pos] as i8;
-                                    match tr101.last_splice_value {
-                                        None => tr101.last_splice_value = Some(val),
-                                        Some(prev) => {
-                                            // Legal: same value, decrement by 1, or wrap -1→0
-                                            if !(val == prev || val == prev - 1 || (prev == -1 && val == 0)) {
-                                                tr101.splice_count_errors += 1;
-                                            }
-                                            tr101.last_splice_value = Some(val);
+                if matches!(analysis_mode, Some(AnalysisMode::Tr101)) && adaption_field_ctrl & 0x02 != 0 && payload_offset > 4 {
+                    let ad_len = chunk[4] as usize;
+                    if ad_len >= 1 {
+                        let flags = chunk[5];
+                        if flags & 0x04 != 0 {
+                            // splice_countdown present
+                            let sc_pos = 6 + ad_len - 1;
+                            if sc_pos < chunk.len() {
+                                let val = chunk[sc_pos] as i8;
+                                match tr101.last_splice_value {
+                                    None => tr101.last_splice_value = Some(val),
+                                    Some(prev) => {
+                                        // Legal: same value, decrement by 1, or wrap -1→0
+                                        if !(val == prev || val == prev - 1 || (prev == -1 && val == 0)) {
+                                            tr101.splice_count_errors += 1;
                                         }
+                                        tr101.last_splice_value = Some(val);
                                     }
                                 }
                             }

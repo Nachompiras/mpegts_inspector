@@ -21,16 +21,16 @@ pub fn parse_pmt(payload:&[u8]) -> anyhow::Result<PmtSection> {
     let b = sec.body;
 
     /* ── cabecera fija dentro del cuerpo ── */
-    let pcr_pid       = ((b[0] & 0x1F) as u16) << 8 | b[1] as u16;
-    let prog_info_len = ((b[2] & 0x0F) as usize) << 8 | b[3] as usize;
+    let pcr_pid       = (((b[0] & 0x1F) as u16) << 8) | (b[1] as u16);
+    let prog_info_len = (((b[2] & 0x0F) as usize) << 8) | (b[3] as usize);
     let mut idx       = 4 + prog_info_len;          // saltamos descriptors
 
     /* ── bucle de ES ── */
     let mut streams = Vec::new();
     while idx + 5 <= b.len() {
         let stype = b[idx];
-        let pid   = ((b[idx+1] & 0x1F) as u16) << 8 | b[idx+2] as u16;
-        let eslen = ((b[idx+3] & 0x0F) as usize) << 8 | b[idx+4] as usize;
+        let pid   = (((b[idx+1] & 0x1F) as u16) << 8) | (b[idx+2] as u16);
+        let eslen = (((b[idx+3] & 0x0F) as usize) << 8) | (b[idx+4] as usize);
         streams.push(StreamInfo{ stream_type:stype, elementary_pid:pid });
         idx += 5 + eslen;                          // saltamos descriptors ES
     }

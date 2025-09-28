@@ -330,7 +330,7 @@ impl Tr101Metrics {
                         /* 2.5 accuracy check */
                         // Only check accuracy if wall_delta is reasonable (10ms to 1000ms)
                         let wall_ms = wall_delta.as_millis() as u64;
-                        if wall_ms >= 10 && wall_ms <= 1000 {
+                        if (10..=1000).contains(&wall_ms) {
                             let expected_ticks = (wall_delta.as_secs_f64() * PCR_CLOCK_HZ).round() as u64;
 
                             // Only check accuracy if ticks_delta is reasonable (avoid wrap-around issues)
@@ -374,10 +374,8 @@ impl Tr101Metrics {
                     let rate = self.null_bytes_in_1s as f64 / self.bytes_in_1s as f64;
 
                     // Only increment error counter if we're monitoring Priority 2+
-                    if matches!(priority_level, crate::types::AnalysisMode::Tr101 | crate::types::AnalysisMode::Tr101Priority12) {
-                        if rate > NULL_RATE_THRESHOLD {
-                            self.null_packet_rate_errors = self.null_packet_rate_errors.saturating_add(1);
-                        }
+                    if matches!(priority_level, crate::types::AnalysisMode::Tr101 | crate::types::AnalysisMode::Tr101Priority12) && rate > NULL_RATE_THRESHOLD {
+                        self.null_packet_rate_errors = self.null_packet_rate_errors.saturating_add(1);
                     }
                 }
 
@@ -389,15 +387,13 @@ impl Tr101Metrics {
         }
 
         /* ───── CAT detection - Priority 2 ───── */
-        if matches!(priority_level, crate::types::AnalysisMode::Tr101 | crate::types::AnalysisMode::Tr101Priority12) {
-            if pid == 0x0001 {          // CAT
-                if let Some(ok) = cat_crc_ok {
-                    if !ok {
-                        self.cat_crc_errors = self.cat_crc_errors.saturating_add(1);
-                    }
+        if matches!(priority_level, crate::types::AnalysisMode::Tr101 | crate::types::AnalysisMode::Tr101Priority12) && pid == 0x0001 {          // CAT
+            if let Some(ok) = cat_crc_ok {
+                if !ok {
+                    self.cat_crc_errors = self.cat_crc_errors.saturating_add(1);
                 }
-                self.last_cat_seen = Some(now);
             }
+            self.last_cat_seen = Some(now);
         }
 
         /* ───── NIT / SDT / EIT / TDT detection - Priority 3 ───── */
@@ -441,22 +437,22 @@ impl Tr101Metrics {
 
         /* ───── NIT/SDT/EIT/TDT timeouts - Priority 3 ───── */
         if matches!(priority_level, crate::types::AnalysisMode::Tr101) {
-            if self.last_nit_seen.map_or(true, |t| t.elapsed()
+            if self.last_nit_seen.is_none_or(|t| t.elapsed()
                     > Duration::from_millis(NIT_TIMEOUT_MS)) {
                 self.nit_timeout += 1;
                 self.last_nit_seen = Some(now);
             }
-            if self.last_sdt_seen.map_or(true, |t| t.elapsed()
+            if self.last_sdt_seen.is_none_or(|t| t.elapsed()
                     > Duration::from_millis(SDT_TIMEOUT_MS)) {
                 self.sdt_timeout += 1;
                 self.last_sdt_seen = Some(now);
             }
-            if self.last_eit_seen.map_or(true, |t| t.elapsed()
+            if self.last_eit_seen.is_none_or(|t| t.elapsed()
                     > Duration::from_millis(EIT_TIMEOUT_MS)) {
                 self.eit_timeout += 1;
                 self.last_eit_seen = Some(now);
             }
-            if self.last_tdt_seen.map_or(true, |t| t.elapsed()
+            if self.last_tdt_seen.is_none_or(|t| t.elapsed()
                     > Duration::from_millis(TDT_TIMEOUT_MS)) {
                 self.tdt_timeout += 1;
                 self.last_tdt_seen = Some(now);

@@ -309,7 +309,7 @@ fn get_bits(data: &[u8], byte_offset: usize, bit_offset: usize, num_bits: usize)
         if get_bit(data, byte_offset, current_bit) {
             result = (result << 1) | 1;
         } else {
-            result = result << 1;
+            result <<= 1;
         }
         current_bit += 1;
     }

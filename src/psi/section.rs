@@ -25,7 +25,7 @@ impl<'a> SectionReader<'a> {
         if payload.len() < start + 8 { anyhow::bail!("short section") }
 
         let table_id = payload[start];
-        let sec_len  = ((payload[start+1] & 0x0F) as usize) << 8 | payload[start+2] as usize;
+        let sec_len  = (((payload[start+1] & 0x0F) as usize) << 8) | (payload[start+2] as usize);
         if sec_len < 5 { anyhow::bail!("invalid section_length") }
         let end      = start + 3 + sec_len;
         if end > payload.len() { anyhow::bail!("truncated section") }

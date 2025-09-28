@@ -189,7 +189,7 @@ fn parse_avc_sps(raw: &[u8]) -> Option<VideoInfo> {
                 fps = (time_scale as f32) / (num_units_in_tick as f32 * divisor);
 
                 // Sanity check: FPS should be reasonable (1-120 fps)
-                if fps < 1.0 || fps > 120.0 {
+                if !(1.0..=120.0).contains(&fps) {
                     fps = 0.0; // Invalid, will be calculated from PTS
                 }
             }
@@ -205,7 +205,7 @@ fn parse_avc_sps(raw: &[u8]) -> Option<VideoInfo> {
     let crop_unit_y = match chroma_format_idc {
         0 => 2 - frame_mbs_only_flag as u32,
         1 | 2 => 2 * (2 - frame_mbs_only_flag as u32),
-        3 => 1 * (2 - frame_mbs_only_flag as u32),
+        3 => 2 - frame_mbs_only_flag as u32,
         _ => 2,
     };
 

@@ -23,7 +23,7 @@ pub fn parse_pat(payload:&[u8]) -> anyhow::Result<PatSection> {
     let mut programs = Vec::new();
     while idx + 4 <= sec.body.len() {
         let pn  = u16::from_be_bytes(sec.body[idx..idx+2].try_into()?);
-        let pid = ((sec.body[idx+2] & 0x1F) as u16) << 8 | sec.body[idx+3] as u16;
+        let pid = (((sec.body[idx+2] & 0x1F) as u16) << 8) | (sec.body[idx+3] as u16);
         idx += 4;
         if pn != 0 { programs.push(PatEntry{ program_number:pn, pmt_pid:pid }); }
     }
