@@ -1,0 +1,454 @@
+//! Main packet processing logic
+
+use std::collections::HashMap;
+use crate::types::{CodecInfo, SubtitleInfo, AnalysisMode};
+use crate::stats::StatsManager;
+use crate::parsers::{parse_video_codec, parse_audio_codec};
+use crate::psi::{parse_pat, parse_pmt, parse_cat, parse_nit, parse_sdt, parse_eit_pf, PatSection, PmtSection};
+use crate::si_cache::SiCache;
+use crate::tr101::Tr101Metrics;
+
+pub struct PacketProcessor {
+    pub pat_map: HashMap<u16, PatSection>,
+    pub pmt_map: HashMap<u16, PmtSection>,
+    pub stats_manager: StatsManager,
+    pub si_cache: SiCache,
+    pub tr101: Option<Tr101Metrics>,
+}
+
+impl PacketProcessor {
+    pub fn new(enable_tr101: bool) -> Self {
+        Self {
+            pat_map: HashMap::new(),
+            pmt_map: HashMap::new(),
+            stats_manager: StatsManager::new(),
+            si_cache: SiCache::default(),
+            tr101: if enable_tr101 { Some(Tr101Metrics::new()) } else { None },
+        }
+    }
+
+    pub fn set_analysis_mode(&mut self, mode: Option<AnalysisMode>) {
+        match mode {
+            Some(AnalysisMode::Tr101) | Some(AnalysisMode::Tr101Priority1) | Some(AnalysisMode::Tr101Priority12) => {
+                if self.tr101.is_none() {
+                    self.tr101 = Some(Tr101Metrics::new());
+                }
+            }
+            Some(AnalysisMode::Mux) => {
+                // Keep existing tr101 instance but don't use it actively
+            }
+            Some(AnalysisMode::None) | None => {
+                // Keep all data structures but minimal processing
+            }
+        }
+    }
+
+    /// Process a single TS packet
+    pub fn process_packet(&mut self, chunk: &[u8], analysis_mode: Option<AnalysisMode>) {
+        if chunk.len() < 188 || chunk[0] != 0x47 {
+            return; // Invalid packet
+        }
+
+        let pid = ((chunk[1] & 0x1F) as u16) << 8 | chunk[2] as u16;
+        let payload_unit_start = chunk[1] & 0x40 != 0;
+        let adaption_field_ctrl = (chunk[3] & 0x30) >> 4;
+        let mut payload_offset = 4usize;
+
+        // State variables for TR-101 reporting
+        let mut pat_crc_ok: Option<bool> = None;
+        let mut pmt_crc_ok: Option<bool> = None;
+        let mut cat_crc_ok: Option<bool> = None;
+        let mut nit_crc_ok: Option<bool> = None;
+        let mut sdt_crc_ok: Option<bool> = None;
+        let mut eit_crc_ok: Option<bool> = None;
+        let mut table_id: u8 = 0xFF;
+
+        // Skip packets with no payload or adaptation field only
+        if adaption_field_ctrl == 2 || adaption_field_ctrl == 0 {
+            return;
+        }
+
+        // Handle adaptation field
+        if adaption_field_ctrl == 3 {
+            let adap_len = chunk[4] as usize;
+            payload_offset += 1 + adap_len;
+            if payload_offset >= 188 {
+                return;
+            }
+        }
+
+        // Extract PCR if present
+        let mut pcr_found: Option<(u64, u16)> = None;
+        if adaption_field_ctrl & 0x02 != 0 && payload_offset > 4 {
+            let ad_len = chunk[4] as usize;
+            if ad_len >= 7 && chunk[5] & 0x10 != 0 { // PCR_flag
+                let p = &chunk[6..12];
+                let base = ((p[0] as u64) << 25)
+                        | ((p[1] as u64) << 17)
+                        | ((p[2] as u64) << 9)
+                        | ((p[3] as u64) << 1)
+                        | ((p[4] as u64) >> 7);
+                let ext = ((p[4] & 0x01) as u16) << 8 | p[5] as u16;
+                pcr_found = Some((base, ext));
+            }
+        }
+
+        let payload = &chunk[payload_offset..];
+
+        // Only process SI tables if in analysis mode
+        if matches!(analysis_mode, Some(AnalysisMode::Mux) | Some(AnalysisMode::Tr101)) {
+            self.process_si_tables(pid, payload_unit_start, payload, &mut pat_crc_ok, &mut pmt_crc_ok, &mut cat_crc_ok, &mut nit_crc_ok, &mut sdt_crc_ok, &mut eit_crc_ok, &mut table_id);
+            self.process_elementary_streams(pid, payload_unit_start, payload);
+        }
+
+        // TR-101 analysis if enabled
+        if matches!(analysis_mode, Some(AnalysisMode::Tr101) | Some(AnalysisMode::Tr101Priority1) | Some(AnalysisMode::Tr101Priority12)) {
+            if let Some(ref mut tr101) = self.tr101 {
+                // Check for service ID mismatch - Priority 3
+                if matches!(analysis_mode, Some(AnalysisMode::Tr101)) {
+                    if self.si_cache.check_service_id_mismatch() {
+                        tr101.service_id_mismatch += 1;
+                    }
+                }
+
+                // Handle splice_countdown in adaptation field - Priority 3
+                if matches!(analysis_mode, Some(AnalysisMode::Tr101)) {
+                    if adaption_field_ctrl & 0x02 != 0 && payload_offset > 4 {
+                        let ad_len = chunk[4] as usize;
+                        if ad_len >= 1 {
+                            let flags = chunk[5];
+                            if flags & 0x04 != 0 {
+                                // splice_countdown present
+                                let sc_pos = 6 + ad_len - 1;
+                                if sc_pos < chunk.len() {
+                                    let val = chunk[sc_pos] as i8;
+                                    match tr101.last_splice_value {
+                                        None => tr101.last_splice_value = Some(val),
+                                        Some(prev) => {
+                                            // Legal: same value, decrement by 1, or wrap -1→0
+                                            if !(val == prev || val == prev - 1 || (prev == -1 && val == 0)) {
+                                                tr101.splice_count_errors += 1;
+                                            }
+                                            tr101.last_splice_value = Some(val);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Call TR-101 packet handler
+                tr101.on_packet(
+                    chunk,
+                    pid,
+                    payload_unit_start,
+                    0x0000,
+                    pat_crc_ok,
+                    pmt_crc_ok,
+                    pcr_found,
+                    cat_crc_ok,
+                    nit_crc_ok,
+                    sdt_crc_ok,
+                    eit_crc_ok,
+                    table_id,
+                    analysis_mode.unwrap(),
+                );
+            }
+        }
+    }
+
+    fn process_si_tables(
+        &mut self,
+        pid: u16,
+        payload_unit_start: bool,
+        payload: &[u8],
+        pat_crc_ok: &mut Option<bool>,
+        pmt_crc_ok: &mut Option<bool>,
+        cat_crc_ok: &mut Option<bool>,
+        nit_crc_ok: &mut Option<bool>,
+        sdt_crc_ok: &mut Option<bool>,
+        eit_crc_ok: &mut Option<bool>,
+        table_id: &mut u8,
+    ) {
+        // PAT (PID 0x0000)
+        if pid == 0x0000 && payload_unit_start {
+            match parse_pat(payload) {
+                Ok(pat) => {
+                    *pat_crc_ok = Some(true);
+                    self.si_cache.update_pat(pat.clone());
+                    for entry in &pat.programs {
+                        self.pat_map.insert(entry.program_number, pat.clone());
+                    }
+                }
+                Err(_) => { *pat_crc_ok = Some(false); }
+            }
+        }
+
+        // CAT (PID 0x0001)
+        if pid == 0x0001 && payload_unit_start {
+            match parse_cat(payload) {
+                Ok((_table_id, _cat)) => {
+                    *cat_crc_ok = Some(true);
+                    *table_id = _table_id;
+                }
+                Err(_) => { *cat_crc_ok = Some(false); }
+            }
+        }
+
+        // NIT (PID 0x0010)
+        if pid == 0x0010 && payload_unit_start {
+            match parse_nit(payload) {
+                Ok((tid, nit)) => {
+                    *nit_crc_ok = Some(true);
+                    *table_id = tid;
+                    self.si_cache.update_nit(nit);
+                }
+                Err(_) => {
+                    *nit_crc_ok = Some(false);
+                }
+            }
+        }
+
+        // PMT
+        if let Some((_prog_num, _pat)) =
+            self.pat_map.iter().find(|(_, p)| p.programs.iter().any(|e| e.pmt_pid == pid))
+        {
+            if payload_unit_start {
+                match parse_pmt(payload) {
+                    Ok(pmt) => {
+                        *pmt_crc_ok = Some(true);
+                        self.si_cache.update_pmt(pid, pmt.clone());
+                        self.pmt_map.insert(pid, pmt.clone());
+                    }
+                    Err(_) => { *pmt_crc_ok = Some(false); }
+                }
+            }
+        }
+
+        // SDT/EIT (PID 0x0011)
+        if pid == 0x0011 && payload_unit_start {
+            let mut handled = false;
+            if sdt_crc_ok.is_none() {
+                if let Ok((tid, sdt)) = parse_sdt(payload) {
+                    *sdt_crc_ok = Some(true);
+                    *table_id = tid;
+                    self.si_cache.update_sdt(sdt);
+                    handled = true;
+                }
+            }
+
+            if !handled {
+                match parse_eit_pf(payload) {
+                    Ok((tid, _eit)) => {
+                        *eit_crc_ok = Some(true);
+                        *table_id = tid;
+                    }
+                    Err(_) => { /* may be TOT/TDT or CRC error → ignore */ }
+                }
+            }
+        }
+    }
+
+    fn process_elementary_streams(&mut self, pid: u16, payload_unit_start: bool, payload: &[u8]) {
+        // Update byte counts for existing streams
+        if self.stats_manager.contains_pid(pid) {
+            self.stats_manager.update_bytes(pid, 188);
+            self.parse_codec_info(pid, payload_unit_start, payload);
+        } else if payload_unit_start {
+            // Check if this PID is an elementary stream from any PMT
+            if let Some((_, pmt)) = self.pmt_map
+                .iter()
+                .find(|(_, p)| p.streams.iter().any(|s| s.elementary_pid == pid))
+            {
+                let stream = pmt
+                    .streams
+                    .iter()
+                    .find(|s| s.elementary_pid == pid)
+                    .unwrap();
+
+                self.stats_manager.add_stream(pid, stream.stream_type);
+                self.stats_manager.update_bytes(pid, 188);
+            }
+        }
+    }
+
+    fn parse_codec_info(&mut self, pid: u16, payload_unit_start: bool, payload: &[u8]) {
+        let Some(stats) = self.stats_manager.get(pid) else { return };
+
+        if stats.codec.is_some() {
+            return; // Already parsed
+        }
+
+        let stream_type = stats.stream_type;
+
+        // Handle stream types that don't require PES header parsing
+        match stream_type {
+            0x06 => {
+                // DVB Subtitle - no ES parsing needed
+                let codec = CodecInfo::Subtitle(SubtitleInfo {
+                    codec: "DVB Subtitle".to_string(),
+                });
+                self.stats_manager.set_codec(pid, codec);
+            }
+            0x03 | 0x04 => {
+                // MPEG-1 Audio Layer II - can be found directly in payload
+                if let Some(mp2) = parse_audio_codec(stream_type, payload) {
+                    let codec = CodecInfo::Audio(mp2);
+                    self.stats_manager.set_codec(pid, codec);
+                }
+            }
+            0x11 => {
+                // AAC LATM - can be found directly in payload
+                if let Some(latm) = parse_audio_codec(stream_type, payload) {
+                    let codec = CodecInfo::Audio(latm);
+                    self.stats_manager.set_codec(pid, codec);
+                }
+            }
+            0x81 => {
+                // AC-3 - can be found directly in payload
+                if let Some(ac3) = parse_audio_codec(stream_type, payload) {
+                    let codec = CodecInfo::Audio(ac3);
+                    self.stats_manager.set_codec(pid, codec);
+                }
+            }
+            _ => {}
+        }
+
+        // Handle PES-based parsing for video and AAC
+        if payload_unit_start && payload.len() >= 6 && payload.starts_with(&[0x00, 0x00, 0x01]) {
+            let pes_hdr_len = 9 + payload[8] as usize;
+            if pes_hdr_len < payload.len() {
+                let es_payload = &payload[pes_hdr_len..];
+
+                // Try video parsing
+                if let Some(video_info) = parse_video_codec(stream_type, es_payload) {
+                    let codec = CodecInfo::Video(video_info);
+                    self.stats_manager.set_codec(pid, codec);
+                }
+                // Try audio parsing
+                else if let Some(audio_info) = parse_audio_codec(stream_type, es_payload) {
+                    let codec = CodecInfo::Audio(audio_info);
+                    self.stats_manager.set_codec(pid, codec);
+                }
+            }
+        }
+
+        // FPS calculation by PTS for video streams
+        self.calculate_fps_from_pts(pid, payload_unit_start, payload);
+    }
+
+    fn calculate_fps_from_pts(&mut self, pid: u16, payload_unit_start: bool, payload: &[u8]) {
+        if !payload_unit_start || payload.len() <= 14 || !payload.starts_with(&[0x00, 0x00, 0x01]) {
+            return;
+        }
+
+        let stream_id = payload[3];
+        if stream_id & 0xF0 != 0xE0 { // Not video stream
+            return;
+        }
+
+        let pts_dts_flags = (payload[7] & 0xC0) >> 6;
+        if pts_dts_flags & 0b10 == 0 { // No PTS
+            return;
+        }
+
+        let p = &payload[9..14];
+        let pts: u64 = ((p[0] as u64 & 0x0E) << 29)
+            | ((p[1] as u64) << 22)
+            | (((p[2] as u64 & 0xFE) >> 1) << 15)
+            | ((p[3] as u64) << 7)
+            | ((p[4] as u64) >> 1);
+
+        if let Some(stats) = self.stats_manager.get_mut(pid) {
+            // Store PTS sample for FPS calculation
+            stats.pts_samples.push(pts);
+
+            // Keep only recent samples (last 10 frames)
+            if stats.pts_samples.len() > 10 {
+                stats.pts_samples.remove(0);
+            }
+
+            if let Some(CodecInfo::Video(ref mut vinfo)) = stats.codec {
+                // Calculate FPS from multiple PTS samples if we have enough
+                if stats.pts_samples.len() >= 3 {
+                    // Sort PTS samples by presentation time (handle B-frames)
+                    let mut sorted_pts = stats.pts_samples.clone();
+                    sorted_pts.sort_unstable();
+
+                    let mut deltas = Vec::new();
+
+                    // Calculate deltas between consecutive sorted PTS values
+                    for i in 1..sorted_pts.len() {
+                        let delta = sorted_pts[i].saturating_sub(sorted_pts[i-1]);
+                        if delta > 0 && delta < 90000 { // Sanity check: delta should be less than 1 second
+                            deltas.push(delta);
+                        }
+                    }
+
+                    if !deltas.is_empty() {
+                        // Use median delta to avoid outliers from B-frames
+                        deltas.sort_unstable();
+                        let median_delta = deltas[deltas.len() / 2];
+                        let fps_est = 90000.0 / median_delta as f32;
+
+
+                        // Only update FPS if:
+                        // 1. We don't have FPS from SPS (fps == 0.0), OR
+                        // 2. The FPS from SPS seems wrong (too different from PTS calculation)
+                        if vinfo.fps == 0.0 || (vinfo.fps - fps_est).abs() > 2.0 {
+                            vinfo.fps = round_to_common_fps(fps_est);
+                        }
+                    }
+                }
+            }
+            stats.last_pts = Some(pts);
+        }
+    }
+
+    /// Clean up old/inactive streams
+    pub fn cleanup_old_streams(&mut self, timeout_secs: u64) {
+        self.stats_manager.cleanup_old_streams(std::time::Duration::from_secs(timeout_secs));
+    }
+
+    /// Get TR-101 metrics reference
+    pub fn get_tr101_metrics(&self) -> Tr101Metrics {
+        self.tr101.as_ref().cloned().unwrap_or_default()
+    }
+}
+
+/// Round estimated FPS to common frame rates for better accuracy
+/// Also handles interlaced video detection (field rate -> frame rate)
+fn round_to_common_fps(fps_est: f32) -> f32 {
+    let frame_rates = [
+        23.976, 24.0, 25.0, 29.97, 30.0, 48.0, 50.0, 60.0, 120.0
+    ];
+    let field_rates = [
+        47.952, 48.0, 50.0, 59.94, 60.0, 96.0, 100.0, 120.0, 240.0
+    ];
+
+    // First, check if it matches common frame rates directly
+    for &rate in &frame_rates {
+        if (fps_est - rate).abs() < 0.5 {
+            return rate;
+        }
+    }
+
+    // Check if it matches common field rates (interlaced video)
+    // If so, divide by 2 to get frame rate
+    for &field_rate in &field_rates {
+        if (fps_est - field_rate).abs() < 0.5 {
+            let frame_rate = field_rate / 2.0;
+            // Verify it's a sensible frame rate
+            for &rate in &frame_rates {
+                if (frame_rate - rate).abs() < 0.1 {
+                    return rate;
+                }
+            }
+            return (frame_rate * 100.0).round() / 100.0;
+        }
+    }
+
+    // Round to 2 decimal places if no common rate found
+    (fps_est * 100.0).round() / 100.0
+}

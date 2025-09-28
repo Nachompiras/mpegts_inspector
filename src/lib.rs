@@ -1,51 +1,45 @@
-// src/lib.rs
+//! MPEG-TS Inspector Library
+//!
+//! This library provides async MPEG-TS packet inspection capabilities
+//! for UDP transport streams (unicast or multicast). It parses PAT/PMT
+//! tables on-the-fly and provides live statistics for elementary streams.
+
+// Internal modules
+mod types;
+mod network;
+mod parsers;
+mod stats;
+mod report;
+mod processor;
+mod psi;
+mod tr101;
+mod si_cache;
+
+// Public API module
 pub mod inspector {
-    use std::net::SocketAddr;
-
-    pub struct Options {
-        pub addr: SocketAddr,
-        pub refresh_secs: u64,
-        pub analysis: bool
-    }
-
-    /// Analysis modes for different levels of processing
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum AnalysisMode {
-        /// Basic stream detection only (codec, bitrate, basic metadata)
-        Mux,
-        /// Full TR 101 290 compliance analysis
-        Tr101,
-        /// No analysis, raw stream detection only
-        None,
-    }
-
-    /// Control commands for runtime analysis mode switching
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub enum AnalysisCommand {
-        Start(AnalysisMode),
-        Stop,
-        GetStatus,
-    }
-
-    /// Response from analysis control commands
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub struct AnalysisStatus {
-        pub current_mode: Option<AnalysisMode>,
-        pub is_running: bool,
-    }
+    // Re-export public types
+    pub use crate::types::{
+        VideoInfo, AudioInfo, SubtitleInfo, CodecInfo, StreamInfo,
+        ProgramInfo, InspectorReport, AnalysisMode, AnalysisCommand,
+        AnalysisStatus, Options
+    };
 
     /// Async entry-point; returns when stopped (Ctrl-C or socket error)
     pub async fn run(opts: Options) -> anyhow::Result<()> {
         crate::core::run(opts).await
     }
 
-    /// Entry-point that reads TS packets from a `tokio::broadcast` channel.
-    pub async fn run_from_broadcast(
+    /// Entry-point that reads TS packets from a broadcast channel and provides structured data via callback.
+    pub async fn run_from_broadcast<F>(
         mut rx: tokio::sync::broadcast::Receiver<Vec<u8>>,
         refresh_secs: u64,
-        analysis: bool,                 // ← legacy flag for compatibility
-    ) -> anyhow::Result<()> {
-        crate::core::run_broadcast(&mut rx, refresh_secs, analysis).await
+        analysis: bool,
+        mut callback: F,
+    ) -> anyhow::Result<()>
+    where
+        F: FnMut(InspectorReport) + Send,
+    {
+        crate::core::run_broadcast(&mut rx, refresh_secs, analysis, &mut callback).await
     }
 
     /// Advanced broadcast entry-point with runtime analysis control
@@ -59,8 +53,8 @@ pub mod inspector {
     }
 }
 
-mod psi;
-mod es;
+// Compatibility module - will be refactored
 mod core;
-mod tr101;
-mod si_cache;
+
+// Re-export TR101 for backwards compatibility
+pub use tr101::Tr101Metrics;
