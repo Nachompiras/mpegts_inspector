@@ -6,6 +6,7 @@
 
 // Internal modules
 mod types;
+mod constants;
 mod network;
 mod parsers;
 mod stats;

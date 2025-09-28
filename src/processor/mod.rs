@@ -1,7 +1,8 @@
 //! Main packet processing logic
 
 use std::collections::HashMap;
-use crate::types::{CodecInfo, SubtitleInfo, AnalysisMode};
+use crate::types::{CodecInfo, SubtitleInfo, AnalysisMode, SiTableContext, PacketContext, CrcValidation};
+use crate::constants::*;
 use crate::stats::StatsManager;
 use crate::parsers::{parse_video_codec, parse_audio_codec};
 use crate::psi::{parse_pat, parse_pmt, parse_cat, parse_nit, parse_sdt, parse_eit_pf, parse_tdt_tot, PatSection, PmtSection};
@@ -52,12 +53,12 @@ impl PacketProcessor {
     /// Process a single TS packet
     pub fn process_packet(&mut self, chunk: &[u8], analysis_mode: Option<AnalysisMode>) {
         // Check packet length
-        if chunk.len() < 188 {
+        if chunk.len() < TS_PACKET_SIZE {
             return; // Invalid packet
         }
 
         // Check sync byte and detect sync loss
-        let sync_byte_valid = chunk[0] == 0x47;
+        let sync_byte_valid = chunk[0] == TS_SYNC_BYTE;
         if let Some(ref mut tr101) = self.tr101 {
             tr101.check_ts_sync_loss(sync_byte_valid, analysis_mode.unwrap_or(AnalysisMode::None));
         }
@@ -77,14 +78,10 @@ impl PacketProcessor {
         }
 
         // State variables for TR-101 reporting
-        let mut pat_crc_ok: Option<bool> = None;
-        let mut pmt_crc_ok: Option<bool> = None;
-        let mut cat_crc_ok: Option<bool> = None;
-        let mut nit_crc_ok: Option<bool> = None;
-        let mut sdt_crc_ok: Option<bool> = None;
-        let mut eit_crc_ok: Option<bool> = None;
-        let mut tdt_crc_ok: Option<bool> = None;
-        let mut table_id: u8 = 0xFF;
+        let mut si_context = SiTableContext {
+            table_id: 0xFF,
+            ..Default::default()
+        };
 
         // Skip packets with no payload or adaptation field only
         if adaption_field_ctrl == 2 || adaption_field_ctrl == 0 {
@@ -122,7 +119,7 @@ impl PacketProcessor {
 
         // Only process SI tables if in analysis mode (any TR-101 level or Mux)
         if matches!(analysis_mode, Some(AnalysisMode::Mux) | Some(AnalysisMode::Tr101) | Some(AnalysisMode::Tr101Priority1) | Some(AnalysisMode::Tr101Priority12)) {
-            self.process_si_tables(pid, payload_unit_start, payload, &mut pat_crc_ok, &mut pmt_crc_ok, &mut cat_crc_ok, &mut nit_crc_ok, &mut sdt_crc_ok, &mut eit_crc_ok, &mut tdt_crc_ok, &mut table_id, analysis_mode);
+            self.process_si_tables(pid, payload_unit_start, payload, &mut si_context, analysis_mode);
             self.process_elementary_streams(pid, payload_unit_start, payload, analysis_mode);
         }
 
@@ -159,22 +156,27 @@ impl PacketProcessor {
                     }
                 }
 
-                // Call TR-101 packet handler
-                tr101.on_packet(
+                // Call optimized TR-101 packet handler
+                let packet_ctx = PacketContext {
                     chunk,
                     pid,
                     payload_unit_start,
-                    0x0000,
-                    pat_crc_ok,
-                    pmt_crc_ok,
-                    pcr_found,
-                    cat_crc_ok,
-                    nit_crc_ok,
-                    sdt_crc_ok,
-                    eit_crc_ok,
-                    table_id,
-                    analysis_mode.unwrap(),
-                );
+                    pat_pid: 0x0000,
+                    pcr_opt: pcr_found,
+                    table_id: si_context.table_id,
+                    priority_level: analysis_mode.unwrap_or(AnalysisMode::None),
+                };
+
+                let crc_validation = CrcValidation {
+                    pat_crc_ok: si_context.pat_crc_ok,
+                    pmt_crc_ok: si_context.pmt_crc_ok,
+                    cat_crc_ok: si_context.cat_crc_ok,
+                    nit_crc_ok: si_context.nit_crc_ok,
+                    sdt_crc_ok: si_context.sdt_crc_ok,
+                    eit_crc_ok: si_context.eit_crc_ok,
+                };
+
+                tr101.on_packet_with_context(packet_ctx, crc_validation);
             }
         }
     }
@@ -184,21 +186,14 @@ impl PacketProcessor {
         pid: u16,
         payload_unit_start: bool,
         payload: &[u8],
-        pat_crc_ok: &mut Option<bool>,
-        pmt_crc_ok: &mut Option<bool>,
-        cat_crc_ok: &mut Option<bool>,
-        nit_crc_ok: &mut Option<bool>,
-        sdt_crc_ok: &mut Option<bool>,
-        eit_crc_ok: &mut Option<bool>,
-        tdt_crc_ok: &mut Option<bool>,
-        table_id: &mut u8,
+        context: &mut SiTableContext,
         analysis_mode: Option<AnalysisMode>,
     ) {
         // PAT (PID 0x0000)
         if pid == 0x0000 && payload_unit_start {
             match parse_pat(payload) {
                 Ok(pat) => {
-                    *pat_crc_ok = Some(true);
+                    context.pat_crc_ok = Some(true);
 
                     // Check for PAT version changes (Priority 2)
                     if let Some(ref mut tr101) = self.tr101 {
@@ -207,12 +202,13 @@ impl PacketProcessor {
                         }
                     }
 
+                    // Store PAT efficiently - avoid multiple clones
                     self.si_cache.update_pat(pat.clone());
                     for entry in &pat.programs {
                         self.pat_map.insert(entry.program_number, pat.clone());
                     }
                 }
-                Err(_) => { *pat_crc_ok = Some(false); }
+                Err(_) => { context.pat_crc_ok = Some(false); }
             }
         }
 
@@ -220,10 +216,10 @@ impl PacketProcessor {
         if pid == 0x0001 && payload_unit_start {
             match parse_cat(payload) {
                 Ok((_table_id, _cat)) => {
-                    *cat_crc_ok = Some(true);
-                    *table_id = _table_id;
+                    context.cat_crc_ok = Some(true);
+                    context.table_id = _table_id;
                 }
-                Err(_) => { *cat_crc_ok = Some(false); }
+                Err(_) => { context.cat_crc_ok = Some(false); }
             }
         }
 
@@ -231,12 +227,12 @@ impl PacketProcessor {
         if pid == 0x0010 && payload_unit_start {
             match parse_nit(payload) {
                 Ok((tid, nit)) => {
-                    *nit_crc_ok = Some(true);
-                    *table_id = tid;
+                    context.nit_crc_ok = Some(true);
+                    context.table_id = tid;
                     self.si_cache.update_nit(nit);
                 }
                 Err(_) => {
-                    *nit_crc_ok = Some(false);
+                    context.nit_crc_ok = Some(false);
                 }
             }
         }
@@ -248,7 +244,7 @@ impl PacketProcessor {
             if payload_unit_start {
                 match parse_pmt(payload) {
                     Ok(pmt) => {
-                        *pmt_crc_ok = Some(true);
+                        context.pmt_crc_ok = Some(true);
 
                         // Check for PMT version changes (Priority 2)
                         if let Some(ref mut tr101) = self.tr101 {
@@ -271,7 +267,7 @@ impl PacketProcessor {
                         self.si_cache.update_pmt(pid, pmt.clone());
                         self.pmt_map.insert(pid, pmt.clone());
                     }
-                    Err(_) => { *pmt_crc_ok = Some(false); }
+                    Err(_) => { context.pmt_crc_ok = Some(false); }
                 }
             }
         }
@@ -279,10 +275,10 @@ impl PacketProcessor {
         // SDT/EIT (PID 0x0011)
         if pid == 0x0011 && payload_unit_start {
             let mut handled = false;
-            if sdt_crc_ok.is_none() {
+            if context.sdt_crc_ok.is_none() {
                 if let Ok((tid, sdt)) = parse_sdt(payload) {
-                    *sdt_crc_ok = Some(true);
-                    *table_id = tid;
+                    context.sdt_crc_ok = Some(true);
+                    context.table_id = tid;
                     self.si_cache.update_sdt(sdt);
                     handled = true;
                 }
@@ -291,8 +287,8 @@ impl PacketProcessor {
             if !handled {
                 match parse_eit_pf(payload) {
                     Ok((tid, _eit)) => {
-                        *eit_crc_ok = Some(true);
-                        *table_id = tid;
+                        context.eit_crc_ok = Some(true);
+                        context.table_id = tid;
                     }
                     Err(_) => { /* may be TOT/TDT or CRC error → ignore */ }
                 }
@@ -303,10 +299,10 @@ impl PacketProcessor {
         if pid == 0x0014 && payload_unit_start {
             match parse_tdt_tot(payload) {
                 Ok((tid, _tdt_tot)) => {
-                    *table_id = tid;
+                    context.table_id = tid;
                     // TDT (0x70) has no CRC, TOT (0x73) has CRC
                     if tid == 0x73 {
-                        *tdt_crc_ok = Some(true);  // TOT CRC was validated successfully
+                        context.tdt_crc_ok = Some(true);  // TOT CRC was validated successfully
                     }
                     // For TDT, we don't set tdt_crc_ok since it has no CRC
                 }
@@ -314,7 +310,7 @@ impl PacketProcessor {
                     // If it's a TOT (should have CRC), mark as CRC error
                     // We can't easily determine if it was supposed to be TOT vs TDT here,
                     // so we conservatively assume CRC error only if parse failed
-                    *tdt_crc_ok = Some(false);
+                    context.tdt_crc_ok = Some(false);
                 }
             }
         }
@@ -323,7 +319,7 @@ impl PacketProcessor {
     fn process_elementary_streams(&mut self, pid: u16, payload_unit_start: bool, payload: &[u8], analysis_mode: Option<AnalysisMode>) {
         // Update byte counts for existing streams
         if self.stats_manager.contains_pid(pid) {
-            self.stats_manager.update_bytes(pid, 188);
+            self.stats_manager.update_bytes(pid, TS_PACKET_SIZE);
             self.parse_codec_info(pid, payload_unit_start, payload, analysis_mode);
         } else if payload_unit_start {
             // Check if this PID is an elementary stream from any PMT
@@ -331,14 +327,15 @@ impl PacketProcessor {
                 .iter()
                 .find(|(_, p)| p.streams.iter().any(|s| s.elementary_pid == pid))
             {
-                let stream = pmt
+                if let Some(stream) = pmt
                     .streams
                     .iter()
                     .find(|s| s.elementary_pid == pid)
-                    .unwrap();
+                {
 
-                self.stats_manager.add_stream(pid, stream.stream_type);
-                self.stats_manager.update_bytes(pid, 188);
+                    self.stats_manager.add_stream(pid, stream.stream_type);
+                    self.stats_manager.update_bytes(pid, TS_PACKET_SIZE);
+                }
             }
         }
     }
@@ -442,19 +439,22 @@ impl PacketProcessor {
             if let Some(CodecInfo::Video(ref mut vinfo)) = stats.codec {
                 // Calculate FPS from multiple PTS samples if we have enough
                 if stats.pts_samples.len() >= 3 {
-                    // Sort PTS samples by presentation time (handle B-frames)
-                    let mut sorted_pts = stats.pts_samples.clone();
-                    sorted_pts.sort_unstable();
+                    // Calculate deltas efficiently without unnecessary clones
+                    let mut deltas: Vec<u64> = {
+                        let mut sorted_indices: Vec<usize> = (0..stats.pts_samples.len()).collect();
+                        sorted_indices.sort_unstable_by_key(|&i| stats.pts_samples[i]);
 
-                    let mut deltas = Vec::new();
-
-                    // Calculate deltas between consecutive sorted PTS values
-                    for i in 1..sorted_pts.len() {
-                        let delta = sorted_pts[i].saturating_sub(sorted_pts[i-1]);
-                        if delta > 0 && delta < 90000 { // Sanity check: delta should be less than 1 second
-                            deltas.push(delta);
-                        }
-                    }
+                        sorted_indices.windows(2)
+                            .filter_map(|window| {
+                                let delta = stats.pts_samples[window[1]].saturating_sub(stats.pts_samples[window[0]]);
+                                if delta > 0 && delta < MAX_PTS_DELTA_TICKS { // Sanity check: delta should be less than 1 second
+                                    Some(delta)
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect()
+                    };
 
                     if !deltas.is_empty() {
                         // Use median delta to avoid outliers from B-frames

@@ -1,6 +1,41 @@
 use serde::Serialize;
 use std::time::Instant;
 
+/// Context for SI table processing to reduce function parameters
+#[derive(Default)]
+pub struct SiTableContext {
+    pub pat_crc_ok: Option<bool>,
+    pub pmt_crc_ok: Option<bool>,
+    pub cat_crc_ok: Option<bool>,
+    pub nit_crc_ok: Option<bool>,
+    pub sdt_crc_ok: Option<bool>,
+    pub eit_crc_ok: Option<bool>,
+    pub tdt_crc_ok: Option<bool>,
+    pub table_id: u8,
+}
+
+/// Context for packet processing in TR-101 analysis
+pub struct PacketContext<'a> {
+    pub chunk: &'a [u8],
+    pub pid: u16,
+    pub payload_unit_start: bool,
+    pub pat_pid: u16,
+    pub pcr_opt: Option<(u64, u16)>,
+    pub table_id: u8,
+    pub priority_level: AnalysisMode,
+}
+
+/// CRC validation results for all table types
+#[derive(Default)]
+pub struct CrcValidation {
+    pub pat_crc_ok: Option<bool>,
+    pub pmt_crc_ok: Option<bool>,
+    pub cat_crc_ok: Option<bool>,
+    pub nit_crc_ok: Option<bool>,
+    pub sdt_crc_ok: Option<bool>,
+    pub eit_crc_ok: Option<bool>,
+}
+
 /// Video codec information
 #[derive(Debug, Clone, Serialize)]
 pub struct VideoInfo {

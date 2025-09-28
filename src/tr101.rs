@@ -3,20 +3,12 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
+use crate::types::{PacketContext, CrcValidation};
+use crate::constants::*;
 
-/// 27 MHz clock: 27 000 000 ticks / second
-const PCR_CLOCK_HZ: f64 = 27_000_000.0;
+// Local constants specific to TR-101 implementation
 /// ±500 ns in PCR ticks  →  27 000 000 * 500e-9  ≈ 13.5
 const PCR_ACCURACY_TICKS: u64 = 14;
-/// Repetition threshold per TR 101 290: maximum 40 ms
-const PCR_REPETITION_MS: u64 = 40;
-
-const NULL_RATE_THRESHOLD: f64 = 0.15;          // 15%
-const CAT_TIMEOUT_MS:  u64 = 2000;   // 2 s
-const NIT_TIMEOUT_MS:  u64 = 2000;   // 2 s
-const SDT_TIMEOUT_MS:  u64 = 2000;   // 2 s
-const EIT_TIMEOUT_MS:  u64 = 2000;   // 2 s
-const TDT_TIMEOUT_MS:  u64 = 2000;   // 2 s
 
 #[derive(Default, Debug, Clone,Serialize)]
 pub struct Tr101Metrics {
@@ -230,271 +222,6 @@ impl Tr101Metrics {
         }
     }
 
-    pub fn on_packet(
-        &mut self,
-        chunk: &[u8],
-        pid: u16,
-        _payload_unit_start: bool,
-        pat_pid: u16,
-        is_pat_crc_ok: Option<bool>,
-        is_pmt_crc_ok: Option<bool>,
-        /* PCR tuple for priority-2 checks */
-        pcr_opt: Option<(u64, u16)>,          // (base, extension)
-
-        /* priority-2/3 table flags                    */
-        cat_crc_ok: Option<bool>,
-        nit_crc_ok: Option<bool>,
-        sdt_crc_ok: Option<bool>,
-        eit_crc_ok: Option<bool>,
-
-        /* last parsed table_id (needed to know SDT vs EIT vs TDT) */
-        table_id: u8,
-
-        /* priority level for selective error reporting */
-        priority_level: crate::types::AnalysisMode,
-    ) {
-        // Basic packet validation
-        if chunk.len() != 188 {
-            return; // Invalid packet size
-        }
-        /* ───── 1.1 sync byte ───── */
-        if chunk[0] != 0x47 {
-            self.sync_byte_errors = self.sync_byte_errors.saturating_add(1);
-            return;
-        }
-
-        /* ───── 1.2 TEI flag ───── */
-        if chunk[1] & 0x80 != 0 {
-            self.transport_error_indicator = self.transport_error_indicator.saturating_add(1);
-        }
-
-        /* ───── 1.4 continuity-counter ───── */
-        // Skip continuity counter check for null packets (PID 0x1FFF)
-        if pid != 0x1FFF {
-            let cc = chunk[3] & 0x0F;
-            let adaptation_field_control = (chunk[3] & 0x30) >> 4;
-
-            // CC should increment for packets with payload or adaptation field
-            // Only skip CC check for adaptation field only packets (0b10)
-            let should_increment_cc = adaptation_field_control != 0b10;
-
-            if let Some(prev) = self.last_cc.insert(pid, cc) {
-                if should_increment_cc && ((prev + 1) & 0x0F) != cc {
-                    self.continuity_counter_errors = self.continuity_counter_errors.saturating_add(1);
-                }
-            }
-        }       
-
-        /* ───── PAT / PMT handling ───── */
-        let now = Instant::now();
-        if pid == pat_pid {
-            if let Some(ok) = is_pat_crc_ok {
-                if !ok {
-                    self.pat_crc_errors = self.pat_crc_errors.saturating_add(1);
-                }
-            }
-            self.last_pat_seen = Some(now);
-        } else if let Some(ok) = is_pmt_crc_ok {
-            if !ok {
-                self.pmt_crc_errors = self.pmt_crc_errors.saturating_add(1);
-            }
-            self.last_pmt_seen.insert(pid, now);
-        }
-
-        /* time-outs - increment only on state transitions */
-        let pat_is_timeout = if let Some(last) = self.last_pat_seen {
-            last.elapsed() > Duration::from_millis(500)
-        } else if let Some(start) = self.startup_time {
-            start.elapsed() > Duration::from_millis(500)
-        } else {
-            false
-        };
-
-        // Only increment on transition to timeout state
-        if pat_is_timeout && !self.pat_timeout_state {
-            self.pat_timeout = self.pat_timeout.saturating_add(1);
-        }
-        self.pat_timeout_state = pat_is_timeout;
-
-        // PMT timeout check - track state per PID
-        for (pmt_pid, last_time) in &self.last_pmt_seen {
-            let is_timeout = last_time.elapsed() > Duration::from_secs(1);
-            let was_timeout = self.pmt_timeout_state.get(pmt_pid).copied().unwrap_or(false);
-
-            // Only increment on transition to timeout
-            if is_timeout && !was_timeout {
-                self.pmt_timeout = self.pmt_timeout.saturating_add(1);
-            }
-            self.pmt_timeout_state.insert(*pmt_pid, is_timeout);
-        }
-
-        /* ───── PCR checks (2.4 / 2.5) - Priority 2 ───── */
-        if matches!(priority_level, crate::types::AnalysisMode::Tr101 | crate::types::AnalysisMode::Tr101Priority12) {
-            if let Some((base, ext)) = pcr_opt {
-                // Validate PCR values are within spec
-                if base > (1u64 << 33) || ext > 299 {
-                    // Invalid PCR values, skip processing
-                    return;
-                }
-
-                // PCR base is in 90kHz units, extension in 27MHz units
-                // Convert to full 27MHz ticks: base * 300 + extension
-                let pcr_ticks = base.saturating_mul(300).saturating_add(ext as u64);
-
-                match self.last_pcr_info.get_mut(&pid) {
-                    None => {
-                        self.last_pcr_info.insert(pid, (pcr_ticks, now));
-                    }
-                    Some((prev_ticks, prev_time)) => {
-                        let wall_delta = prev_time.elapsed();
-
-                        // Handle PCR wrap-around (33-bit counter wraps every ~26.5 hours)
-                        const PCR_WRAP: u64 = (1u64 << 33) * 300; // PCR wraps at 2^33 in 90kHz units
-                        let ticks_delta = if pcr_ticks >= *prev_ticks {
-                            pcr_ticks - *prev_ticks
-                        } else {
-                            // Handle wrap-around
-                            (PCR_WRAP - *prev_ticks) + pcr_ticks
-                        };
-
-                        /* 2.4 repetition check */
-                        if wall_delta.as_millis() as u64 > PCR_REPETITION_MS {
-                            self.pcr_repetition_errors = self.pcr_repetition_errors.saturating_add(1);
-                        }
-
-                        /* 2.5 accuracy check */
-                        // Only check accuracy if wall_delta is reasonable (10ms to 1000ms)
-                        let wall_ms = wall_delta.as_millis() as u64;
-                        if (10..=1000).contains(&wall_ms) {
-                            let expected_ticks = (wall_delta.as_secs_f64() * PCR_CLOCK_HZ).round() as u64;
-
-                            // Only check accuracy if ticks_delta is reasonable (avoid wrap-around issues)
-                            if ticks_delta < expected_ticks * 2 {
-                                let error = if ticks_delta > expected_ticks {
-                                    ticks_delta - expected_ticks
-                                } else {
-                                    expected_ticks - ticks_delta
-                                };
-
-                                if error > PCR_ACCURACY_TICKS {
-                                    self.pcr_accuracy_errors = self.pcr_accuracy_errors.saturating_add(1);
-                                }
-                            }
-                        }
-
-                        /* update state */
-                        *prev_ticks = pcr_ticks;
-                        *prev_time = now;
-                    }
-                }
-            }
-        }
-
-        /* ───── null-packet rate counting - Priority 2 ───── */
-        // Always count bytes for accurate statistics, but only report errors in Priority 2+
-        self.bytes_in_1s += 188;
-        if pid == 0x1FFF {
-            self.null_bytes_in_1s += 188;
-        }
-
-        // Initialize rate check timestamp if not set
-        if self.last_rate_check.is_none() {
-            self.last_rate_check = Some(now);
-        }
-
-        // Check rate every second
-        if let Some(last_check) = self.last_rate_check {
-            if now.duration_since(last_check) >= Duration::from_secs(1) {
-                if self.bytes_in_1s > 0 {
-                    let rate = self.null_bytes_in_1s as f64 / self.bytes_in_1s as f64;
-
-                    // Only increment error counter if we're monitoring Priority 2+
-                    if matches!(priority_level, crate::types::AnalysisMode::Tr101 | crate::types::AnalysisMode::Tr101Priority12) && rate > NULL_RATE_THRESHOLD {
-                        self.null_packet_rate_errors = self.null_packet_rate_errors.saturating_add(1);
-                    }
-                }
-
-                // Reset counters and update timestamp
-                self.bytes_in_1s = 0;
-                self.null_bytes_in_1s = 0;
-                self.last_rate_check = Some(now);
-            }
-        }
-
-        /* ───── CAT detection - Priority 2 ───── */
-        if matches!(priority_level, crate::types::AnalysisMode::Tr101 | crate::types::AnalysisMode::Tr101Priority12) && pid == 0x0001 {          // CAT
-            if let Some(ok) = cat_crc_ok {
-                if !ok {
-                    self.cat_crc_errors = self.cat_crc_errors.saturating_add(1);
-                }
-            }
-            self.last_cat_seen = Some(now);
-        }
-
-        /* ───── NIT / SDT / EIT / TDT detection - Priority 3 ───── */
-        if matches!(priority_level, crate::types::AnalysisMode::Tr101) {
-            match pid {
-                0x0010 => {          // NIT
-                    if let Some(ok) = nit_crc_ok { if !ok { self.nit_crc_errors += 1; } }
-                    self.last_nit_seen = Some(now);
-                }
-                0x0011 => {          // SDT, BAT, EIT, RST, TDT/TOT share 0x11
-                    if table_id == 0x42 || table_id == 0x46 {      // SDT actual/other
-                        if let Some(ok) = sdt_crc_ok { if !ok { self.sdt_crc_errors += 1; } }
-                        self.last_sdt_seen = Some(now);
-                    } else if table_id == 0x4E || table_id == 0x4F { // EIT p/f
-                        if let Some(ok) = eit_crc_ok { if !ok { self.eit_crc_errors += 1; } }
-                        self.last_eit_seen = Some(now);
-                    } else if table_id == 0x70 || table_id == 0x73 { // TDT/TOT
-                        self.last_tdt_seen = Some(now);
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        /* ───── CAT timeout - Priority 2 ───── */
-        if matches!(priority_level, crate::types::AnalysisMode::Tr101 | crate::types::AnalysisMode::Tr101Priority12) {
-            let cat_is_timeout = if let Some(last_cat) = self.last_cat_seen {
-                last_cat.elapsed() > Duration::from_millis(CAT_TIMEOUT_MS)
-            } else if let Some(start) = self.startup_time {
-                start.elapsed() > Duration::from_millis(CAT_TIMEOUT_MS)
-            } else {
-                false
-            };
-
-            // Only increment on transition to timeout state
-            if cat_is_timeout && !self.cat_timeout_state {
-                self.cat_timeout = self.cat_timeout.saturating_add(1);
-            }
-            self.cat_timeout_state = cat_is_timeout;
-        }
-
-        /* ───── NIT/SDT/EIT/TDT timeouts - Priority 3 ───── */
-        if matches!(priority_level, crate::types::AnalysisMode::Tr101) {
-            if self.last_nit_seen.is_none_or(|t| t.elapsed()
-                    > Duration::from_millis(NIT_TIMEOUT_MS)) {
-                self.nit_timeout += 1;
-                self.last_nit_seen = Some(now);
-            }
-            if self.last_sdt_seen.is_none_or(|t| t.elapsed()
-                    > Duration::from_millis(SDT_TIMEOUT_MS)) {
-                self.sdt_timeout += 1;
-                self.last_sdt_seen = Some(now);
-            }
-            if self.last_eit_seen.is_none_or(|t| t.elapsed()
-                    > Duration::from_millis(EIT_TIMEOUT_MS)) {
-                self.eit_timeout += 1;
-                self.last_eit_seen = Some(now);
-            }
-            if self.last_tdt_seen.is_none_or(|t| t.elapsed()
-                    > Duration::from_millis(TDT_TIMEOUT_MS)) {
-                self.tdt_timeout += 1;
-                self.last_tdt_seen = Some(now);
-            }
-        }
-    }
-
     /// Check for PAT version change (Priority 2)
     pub fn check_pat_version_change(&mut self, program_number: u16, new_version: u8, priority_level: crate::types::AnalysisMode) -> bool {
         if !matches!(priority_level, crate::types::AnalysisMode::Tr101 | crate::types::AnalysisMode::Tr101Priority12) {
@@ -557,7 +284,7 @@ impl Tr101Metrics {
             self.sync_loss_counter = self.sync_loss_counter.saturating_add(1);
 
             // After consecutive sync losses, count as TS sync loss
-            if self.sync_loss_counter >= 5 {
+            if self.sync_loss_counter >= SYNC_LOSS_THRESHOLD {
                 self.ts_sync_loss = self.ts_sync_loss.saturating_add(1);
             }
         }
@@ -569,17 +296,7 @@ impl Tr101Metrics {
             return;
         }
 
-        // System PIDs that are always allowed
-        const SYSTEM_PIDS: &[u16] = &[
-            0x0000, // PAT
-            0x0001, // CAT
-            0x0010, // NIT
-            0x0011, // SDT/BAT/EIT
-            0x0012, // EIT
-            0x0013, // RST/ST
-            0x0014, // TDT/TOT
-            0x1FFF, // Null packets
-        ];
+        // Use system PIDs from constants
 
         // Allow system PIDs
         if SYSTEM_PIDS.contains(&pid) {
@@ -606,15 +323,15 @@ impl Tr101Metrics {
 
         if let Some(&last_pts) = self.last_pts_per_pid.get(&pid) {
             // Check for PTS discontinuity (backward jump or too large forward jump)
-            const MAX_PTS_JUMP: u64 = 90000 * 5; // 5 seconds at 90kHz
+            use crate::constants::MAX_PTS_JUMP;
 
             if pts < last_pts {
                 // Backward PTS jump (unless it's a wrap-around)
-                const PTS_WRAP: u64 = 1u64 << 33; // 33-bit PTS counter
+                use crate::constants::PTS_WRAP_THRESHOLD;
                 let pts_diff = last_pts - pts;
 
                 // If the difference is large, it might be a wrap-around
-                if pts_diff < PTS_WRAP / 2 {
+                if pts_diff < PTS_WRAP_THRESHOLD / 2 {
                     self.pts_errors = self.pts_errors.saturating_add(1);
                 }
             } else {
@@ -627,5 +344,232 @@ impl Tr101Metrics {
         }
 
         self.last_pts_per_pid.insert(pid, pts);
+    }
+
+    /// Optimized packet handler with context structs (eliminates 'too many arguments' warning)
+    pub fn on_packet_with_context(
+        &mut self,
+        packet_ctx: PacketContext,
+        crc_validation: CrcValidation,
+    ) {
+        use crate::constants::*;
+
+        // Basic packet validation
+        if packet_ctx.chunk.len() != TS_PACKET_SIZE {
+            return; // Invalid packet size
+        }
+
+        /* ───── 1.1 sync byte ───── */
+        if packet_ctx.chunk[0] != TS_SYNC_BYTE {
+            self.sync_byte_errors = self.sync_byte_errors.saturating_add(1);
+            return;
+        }
+
+        /* ───── 1.2 TEI flag ───── */
+        if packet_ctx.chunk[1] & 0x80 != 0 {
+            self.transport_error_indicator = self.transport_error_indicator.saturating_add(1);
+        }
+
+        /* ───── 1.4 continuity-counter ───── */
+        // Skip continuity counter check for null packets (PID 0x1FFF)
+        if packet_ctx.pid != 0x1FFF {
+            let cc = packet_ctx.chunk[3] & 0x0F;
+            let adaptation_field_control = (packet_ctx.chunk[3] & 0x30) >> 4;
+
+            // CC should increment for packets with payload or adaptation field
+            // Only skip CC check for adaptation field only packets (0b10)
+            let should_increment_cc = adaptation_field_control != 0b10;
+
+            if let Some(prev) = self.last_cc.insert(packet_ctx.pid, cc) {
+                if should_increment_cc && ((prev + 1) & 0x0F) != cc {
+                    self.continuity_counter_errors = self.continuity_counter_errors.saturating_add(1);
+                }
+            }
+        }
+
+        /* ───── PAT / PMT handling ───── */
+        let now = Instant::now();
+        if packet_ctx.pid == packet_ctx.pat_pid {
+            if let Some(ok) = crc_validation.pat_crc_ok {
+                if !ok {
+                    self.pat_crc_errors = self.pat_crc_errors.saturating_add(1);
+                }
+            }
+            self.last_pat_seen = Some(now);
+        } else if let Some(ok) = crc_validation.pmt_crc_ok {
+            if !ok {
+                self.pmt_crc_errors = self.pmt_crc_errors.saturating_add(1);
+            }
+            self.last_pmt_seen.insert(packet_ctx.pid, now);
+        }
+
+        /* time-outs - increment only on state transitions */
+        if let Some(start_time) = self.startup_time {
+            if start_time.elapsed() > Duration::from_millis(1000) {
+                // Check PAT timeout
+                let was_timeout = self.pat_timeout_state;
+                let is_timeout = self.last_pat_seen.is_none_or(|last|
+                    last.elapsed() > Duration::from_millis(PAT_TIMEOUT_MS)
+                );
+                if is_timeout && !was_timeout {
+                    self.pat_timeout = self.pat_timeout.saturating_add(1);
+                }
+                self.pat_timeout_state = is_timeout;
+
+                // Check PMT timeouts for all known PMT PIDs
+                for (&pmt_pid, &last_seen) in &self.last_pmt_seen {
+                    let was_timeout = self.pmt_timeout_state.get(&pmt_pid).unwrap_or(&false);
+                    let is_timeout = last_seen.elapsed() > Duration::from_millis(PMT_TIMEOUT_MS);
+                    if is_timeout && !was_timeout {
+                        self.pmt_timeout = self.pmt_timeout.saturating_add(1);
+                    }
+                    self.pmt_timeout_state.insert(pmt_pid, is_timeout);
+                }
+            }
+        }
+
+        /* ───── PCR checks (2.4 / 2.5) - Priority 2 ───── */
+        if matches!(packet_ctx.priority_level, crate::types::AnalysisMode::Tr101 | crate::types::AnalysisMode::Tr101Priority12) {
+            if let Some((base, ext)) = packet_ctx.pcr_opt {
+                // Validate PCR values are within spec
+                if base > (1u64 << 33) || ext > 299 {
+                    // Invalid PCR values, skip processing
+                    return;
+                }
+
+                // PCR base is in 90kHz units, extension in 27MHz units
+                // Convert to full 27MHz ticks: base * 300 + extension
+                let pcr_ticks = base.saturating_mul(300).saturating_add(ext as u64);
+
+                match self.last_pcr_info.get_mut(&packet_ctx.pid) {
+                    None => {
+                        self.last_pcr_info.insert(packet_ctx.pid, (pcr_ticks, now));
+                    }
+                    Some((prev_ticks, prev_time)) => {
+                        let wall_delta = prev_time.elapsed();
+
+                        // Handle PCR wrap-around (33-bit counter wraps every ~26.5 hours)
+                        const PCR_WRAP: u64 = (1u64 << 33) * 300; // PCR wraps at 2^33 in 90kHz units
+                        let ticks_delta = if pcr_ticks >= *prev_ticks {
+                            pcr_ticks - *prev_ticks
+                        } else {
+                            // Handle wrap-around
+                            (PCR_WRAP - *prev_ticks) + pcr_ticks
+                        };
+
+                        /* 2.4 repetition check */
+                        if wall_delta.as_millis() as u64 > PCR_REPETITION_MS {
+                            self.pcr_repetition_errors = self.pcr_repetition_errors.saturating_add(1);
+                        }
+
+                        /* 2.5 accuracy check */
+                        // Only check accuracy if wall_delta is reasonable (10ms to 1000ms)
+                        let wall_ms = wall_delta.as_millis() as u64;
+                        if (10..=1000).contains(&wall_ms) {
+                            let expected_ticks = (wall_delta.as_secs_f64() * PCR_CLOCK_HZ).round() as u64;
+
+                            // Only check accuracy if ticks_delta is reasonable (avoid wrap-around issues)
+                            if ticks_delta < expected_ticks * 2 {
+                                let error = if ticks_delta > expected_ticks {
+                                    ticks_delta - expected_ticks
+                                } else {
+                                    expected_ticks - ticks_delta
+                                };
+                                if error > PCR_ACCURACY_TICKS {
+                                    self.pcr_accuracy_errors = self.pcr_accuracy_errors.saturating_add(1);
+                                }
+                            }
+                        }
+
+                        *prev_ticks = pcr_ticks;
+                        *prev_time = now;
+                    }
+                }
+            }
+        }
+
+        /* ───── byte rate / null packet rate check (2.6) ───── */
+        self.bytes_in_1s += packet_ctx.chunk.len() as u64;
+        if packet_ctx.pid == 0x1FFF {
+            self.null_bytes_in_1s += packet_ctx.chunk.len() as u64;
+        }
+
+        if let Some(last_check) = self.last_rate_check {
+            if last_check.elapsed() >= Duration::from_secs(1) {
+                let total = self.bytes_in_1s;
+                let null_bytes = self.null_bytes_in_1s;
+                if total > 0 {
+                    let rate = null_bytes as f64 / total as f64;
+
+                    // Only increment error counter if we're monitoring Priority 2+
+                    if matches!(packet_ctx.priority_level, crate::types::AnalysisMode::Tr101 | crate::types::AnalysisMode::Tr101Priority12) && rate > NULL_RATE_THRESHOLD {
+                        self.null_packet_rate_errors = self.null_packet_rate_errors.saturating_add(1);
+                    }
+                }
+
+                // Reset counters and update timestamp
+                self.bytes_in_1s = 0;
+                self.null_bytes_in_1s = 0;
+                self.last_rate_check = Some(now);
+            }
+        } else {
+            self.last_rate_check = Some(now);
+        }
+
+        /* ───── CAT / NIT / SDT / EIT timeout and CRC errors ───── */
+        if matches!(packet_ctx.priority_level, crate::types::AnalysisMode::Tr101 | crate::types::AnalysisMode::Tr101Priority12) && packet_ctx.pid == 0x0001 {          // CAT
+            if let Some(ok) = crc_validation.cat_crc_ok {
+                if !ok {
+                    self.cat_crc_errors = self.cat_crc_errors.saturating_add(1);
+                }
+            }
+            self.last_cat_seen = Some(now);
+        }
+
+        /* ───── NIT / SDT / EIT / TDT detection - Priority 3 ───── */
+        if matches!(packet_ctx.priority_level, crate::types::AnalysisMode::Tr101) {
+            match packet_ctx.pid {
+                0x0010 => {          // NIT
+                    if let Some(ok) = crc_validation.nit_crc_ok { if !ok { self.nit_crc_errors += 1; } }
+                    self.last_nit_seen = Some(now);
+                }
+                0x0011 => {          // SDT / EIT
+                    if packet_ctx.table_id == 0x42 || packet_ctx.table_id == 0x46 { // SDT
+                        if let Some(ok) = crc_validation.sdt_crc_ok { if !ok { self.sdt_crc_errors += 1; } }
+                        self.last_sdt_seen = Some(now);
+                    } else if packet_ctx.table_id == 0x4E || packet_ctx.table_id == 0x4F { // EIT p/f
+                        if let Some(ok) = crc_validation.eit_crc_ok { if !ok { self.eit_crc_errors += 1; } }
+                        self.last_eit_seen = Some(now);
+                    } else if packet_ctx.table_id == 0x70 || packet_ctx.table_id == 0x73 { // TDT/TOT
+                        self.last_tdt_seen = Some(now);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        /* ───── NIT/SDT/EIT/TDT timeouts - Priority 3 ───── */
+        if matches!(packet_ctx.priority_level, crate::types::AnalysisMode::Tr101) {
+            if self.last_nit_seen.is_none_or(|t| t.elapsed()
+                    > Duration::from_millis(NIT_TIMEOUT_MS)) {
+                self.nit_timeout += 1;
+                self.last_nit_seen = Some(now);
+            }
+            if self.last_sdt_seen.is_none_or(|t| t.elapsed()
+                    > Duration::from_millis(SDT_TIMEOUT_MS)) {
+                self.sdt_timeout += 1;
+                self.last_sdt_seen = Some(now);
+            }
+            if self.last_eit_seen.is_none_or(|t| t.elapsed()
+                    > Duration::from_millis(EIT_TIMEOUT_MS)) {
+                self.eit_timeout += 1;
+                self.last_eit_seen = Some(now);
+            }
+            if self.last_tdt_seen.is_none_or(|t| t.elapsed()
+                    > Duration::from_millis(TDT_TIMEOUT_MS)) {
+                self.tdt_timeout += 1;
+                self.last_tdt_seen = Some(now);
+            }
+        }
     }
 }

@@ -1,10 +1,7 @@
 //! Report generation for MPEG-TS inspection results
 
-use std::collections::HashMap;
 use serde::Serialize;
 use crate::types::{InspectorReport, ProgramInfo, StreamInfo, CodecInfo};
-use crate::stats::StatsManager;
-use crate::psi::{PatSection, PmtSection};
 use crate::tr101::Tr101Metrics;
 
 /// JSON structure for elementary streams (internal serialization)
@@ -196,73 +193,6 @@ impl Reporter {
             programs: programs_out,
             tr101: &filtered_tr101,
         };
-        serde_json::to_string_pretty(&rep).unwrap()
-    }
-
-    /// Generate console output report (for debugging)
-    pub fn print_console_report(
-        pat_map: &HashMap<u16, PatSection>,
-        pmt_map: &HashMap<u16, PmtSection>,
-        stats_manager: &StatsManager,
-    ) {
-        println!("================ MPEG-TS Inspector =================");
-        for (prog_num, pat) in pat_map {
-            println!("Program #{prog_num}");
-            // find PMT
-            if let Some(pmt_pid) = pat.programs
-                .iter()
-                .find(|p| p.program_number == *prog_num)
-                .map(|p| p.pmt_pid)
-            {
-                if let Some(pmt) = pmt_map.get(&pmt_pid) {
-                    for s in &pmt.streams {
-                        let pid = s.elementary_pid;
-                        if let Some(stats) = stats_manager.get(pid) {
-                            if let Some(bitrate_kbps) = stats_manager.calculate_bitrate(pid) {
-                                let (codec_name, extra) = match &stats.codec {
-                                    Some(CodecInfo::Video(v)) => (
-                                        v.codec.as_str(),
-                                        format!("{}×{} {:.2} fps {}", v.width, v.height, v.fps, v.chroma),
-                                    ),
-                                    Some(CodecInfo::Audio(a)) => (
-                                        a.codec.as_str(),
-                                        format!("{}ch {} Hz",
-                                            a.channels.map_or("?".to_string(), |c| c.to_string()),
-                                            a.sample_rate.map_or("?".to_string(), |sr| sr.to_string())
-                                        ),
-                                    ),
-                                    Some(CodecInfo::Subtitle(sub)) => (
-                                        sub.codec.as_str(),
-                                        String::new(),
-                                    ),
-                                    None => ("Unknown", String::new()),
-                                };
-                                println!(
-                                    "  PID 0x{pid:04X} | {: <4} {: <9} | {:>6.1} kb/s {}",
-                                    Self::stream_type_name(s.stream_type),
-                                    codec_name,
-                                    bitrate_kbps,
-                                    extra
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    fn stream_type_name(st: u8) -> &'static str {
-        match st {
-            0x1B => "H.264",
-            0x24 => "HEVC",
-            0x0F => "AAC",
-            0x11 => "LATM",    // AAC LATM
-            0x02 => "MPEG2",
-            0x03 | 0x04 => "MP2",
-            0x81 => "AC-3",
-            0x06 => "DVB-Sub",
-            _ => "unk",
-        }
-    }
+        serde_json::to_string_pretty(&rep).unwrap_or_else(|_| "{\"error\": \"JSON serialization failed\"}".to_string())
+    }            
 }
