@@ -489,7 +489,13 @@ impl Tr101Metrics {
                         };
 
                         /* 2.4 repetition check */
-                        if wall_delta.as_millis() as u64 > PCR_REPETITION_MS {
+                        // TR 101 290: PCR shall occur at least every 100ms in the stream timeline
+                        // We measure this using the PCR timestamps themselves, not wall clock,
+                        // to avoid false positives from network jitter and buffering
+                        let pcr_time_delta_ms = (ticks_delta as f64 / PCR_CLOCK_HZ * 1000.0) as u64;
+
+                        // Only flag if PCR gap exceeds threshold AND it's not a wrap-around situation
+                        if pcr_time_delta_ms > PCR_REPETITION_MS && pcr_time_delta_ms < 5000 {
                             self.pcr_repetition_errors = self.pcr_repetition_errors.saturating_add(1);
                         }
 
