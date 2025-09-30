@@ -7,8 +7,11 @@ use crate::types::{PacketContext, CrcValidation};
 use crate::constants::*;
 
 // Local constants specific to TR-101 implementation
-/// ±500 ns in PCR ticks  →  27 000 000 * 500e-9  ≈ 13.5
-const PCR_ACCURACY_TICKS: u64 = 14;
+/// PCR accuracy tolerance in PCR ticks (27 MHz)
+/// TR 101 290 specifies ±500ns, but we use a more permissive threshold
+/// to avoid false positives from network jitter and OS scheduling
+/// 500 µs = 27,000,000 * 500e-6 = 13,500 ticks
+const PCR_ACCURACY_TICKS: u64 = 13_500;
 
 #[derive(Default, Debug, Clone,Serialize)]
 pub struct Tr101Metrics {
@@ -291,21 +294,42 @@ impl Tr101Metrics {
     }
 
     /// Check for PID errors (Priority 1)
+    /// Only flags truly invalid PIDs per TR 101 290 spec, not undeclared PIDs
     pub fn check_pid_error(&mut self, pid: u16, priority_level: crate::types::AnalysisMode) {
         if !matches!(priority_level, crate::types::AnalysisMode::Tr101 | crate::types::AnalysisMode::Tr101Priority12 | crate::types::AnalysisMode::Tr101Priority1) {
             return;
         }
 
-        // Use system PIDs from constants
-
-        // Allow system PIDs
+        // Allow system PIDs (PAT, CAT, NIT, SDT, EIT, TDT, etc.)
         if SYSTEM_PIDS.contains(&pid) {
             self.known_pids.insert(pid);
             return;
         }
 
-        // Check if this PID was declared in PMT or is known
-        if !self.known_pids.contains(&pid) {
+        // Allow null packets
+        if pid == 0x1FFF {
+            return;
+        }
+
+        // Allow PIDs declared in PMT
+        if self.known_pids.contains(&pid) {
+            return;
+        }
+
+        // Per TR 101 290, we should only flag PIDs that are:
+        // 1. Reserved (0x0002-0x000F except those in SYSTEM_PIDS)
+        // 2. Invalid range (> 0x1FFE)
+        // We don't flag undeclared PIDs as errors since they may be legitimate
+        // private data, stuffing, or services we haven't parsed yet
+
+        // Flag reserved PIDs that shouldn't be used
+        if (0x0002..=0x000F).contains(&pid) && !SYSTEM_PIDS.contains(&pid) {
+            self.pid_errors = self.pid_errors.saturating_add(1);
+            return;
+        }
+
+        // Flag invalid PID range (should never happen with 13-bit PID, but check anyway)
+        if pid > 0x1FFE {
             self.pid_errors = self.pid_errors.saturating_add(1);
         }
     }
@@ -463,9 +487,10 @@ impl Tr101Metrics {
                         }
 
                         /* 2.5 accuracy check */
-                        // Only check accuracy if wall_delta is reasonable (10ms to 1000ms)
+                        // Only check accuracy if wall_delta is reasonable (100ms to 1000ms)
+                        // Using larger windows reduces false positives from network jitter
                         let wall_ms = wall_delta.as_millis() as u64;
-                        if (10..=1000).contains(&wall_ms) {
+                        if (100..=1000).contains(&wall_ms) {
                             let expected_ticks = (wall_delta.as_secs_f64() * PCR_CLOCK_HZ).round() as u64;
 
                             // Only check accuracy if ticks_delta is reasonable (avoid wrap-around issues)
@@ -475,7 +500,13 @@ impl Tr101Metrics {
                                 } else {
                                     expected_ticks - ticks_delta
                                 };
-                                if error > PCR_ACCURACY_TICKS {
+
+                                // Calculate error rate (ppm - parts per million)
+                                let error_ppm = (error as f64 / expected_ticks as f64) * 1_000_000.0;
+
+                                // Flag only if error exceeds threshold AND error rate is significant
+                                // This prevents false positives from small timing variations
+                                if error > PCR_ACCURACY_TICKS && error_ppm > 100.0 {
                                     self.pcr_accuracy_errors = self.pcr_accuracy_errors.saturating_add(1);
                                 }
                             }
