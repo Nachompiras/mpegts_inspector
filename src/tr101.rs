@@ -8,10 +8,11 @@ use crate::constants::*;
 
 // Local constants specific to TR-101 implementation
 /// PCR accuracy tolerance in PCR ticks (27 MHz)
-/// TR 101 290 specifies ±500ns, but we use a more permissive threshold
-/// to avoid false positives from network jitter and OS scheduling
-/// 500 µs = 27,000,000 * 500e-6 = 13,500 ticks
-const PCR_ACCURACY_TICKS: u64 = 13_500;
+/// TR 101 290 specifies ±500ns, but measuring this accurately via system clock
+/// is impractical due to network jitter and OS scheduling.
+/// We use 10ms threshold to catch only severe timing issues.
+/// 10 ms = 27,000,000 * 0.01 = 270,000 ticks
+const PCR_ACCURACY_TICKS: u64 = 270_000;
 
 #[derive(Default, Debug, Clone,Serialize)]
 pub struct Tr101Metrics {
@@ -340,28 +341,34 @@ impl Tr101Metrics {
     }
 
     /// Check for PTS errors (Priority 2)
+    /// Note: PTS discontinuities can be legitimate (ad insertion, stream switching)
+    /// so we only flag severe backward jumps as errors
     pub fn check_pts_error(&mut self, pid: u16, pts: u64, priority_level: crate::types::AnalysisMode) {
         if !matches!(priority_level, crate::types::AnalysisMode::Tr101 | crate::types::AnalysisMode::Tr101Priority12) {
             return;
         }
 
         if let Some(&last_pts) = self.last_pts_per_pid.get(&pid) {
-            // Check for PTS discontinuity (backward jump or too large forward jump)
-            use crate::constants::MAX_PTS_JUMP;
+            use crate::constants::{MAX_PTS_JUMP, PTS_WRAP_THRESHOLD};
 
             if pts < last_pts {
-                // Backward PTS jump (unless it's a wrap-around)
-                use crate::constants::PTS_WRAP_THRESHOLD;
+                // Backward PTS jump - check if it's a wrap-around or legitimate discontinuity
                 let pts_diff = last_pts - pts;
 
-                // If the difference is large, it might be a wrap-around
-                if pts_diff < PTS_WRAP_THRESHOLD / 2 {
+                // Only flag as error if it's a small backward jump (not wrap-around)
+                // Large backward jumps are likely wrap-around or intentional discontinuities
+                // Small backward jumps (< 1 second) indicate real timing errors
+                if pts_diff < 90_000 {  // Less than 1 second backward
                     self.pts_errors = self.pts_errors.saturating_add(1);
                 }
+                // Wrap-around case: pts_diff is very large (close to PTS_WRAP_THRESHOLD)
+                // This is normal and not an error
             } else {
                 let pts_diff = pts - last_pts;
-                // Check for too large forward jump
-                if pts_diff > MAX_PTS_JUMP {
+                // We no longer flag large forward jumps as errors since they can be
+                // legitimate (ad insertion, stream switching, seeking, etc.)
+                // Only extremely large jumps that suggest data corruption are flagged
+                if pts_diff > MAX_PTS_JUMP && pts_diff < PTS_WRAP_THRESHOLD / 2 {
                     self.pts_errors = self.pts_errors.saturating_add(1);
                 }
             }
@@ -487,14 +494,13 @@ impl Tr101Metrics {
                         }
 
                         /* 2.5 accuracy check */
-                        // Only check accuracy if wall_delta is reasonable (100ms to 1000ms)
-                        // Using larger windows reduces false positives from network jitter
+                        // Only check accuracy for large windows (500ms+) to minimize jitter effects
                         let wall_ms = wall_delta.as_millis() as u64;
-                        if (100..=1000).contains(&wall_ms) {
+                        if wall_ms >= 500 && wall_ms <= 2000 {
                             let expected_ticks = (wall_delta.as_secs_f64() * PCR_CLOCK_HZ).round() as u64;
 
                             // Only check accuracy if ticks_delta is reasonable (avoid wrap-around issues)
-                            if ticks_delta < expected_ticks * 2 {
+                            if ticks_delta < expected_ticks * 2 && ticks_delta > expected_ticks / 2 {
                                 let error = if ticks_delta > expected_ticks {
                                     ticks_delta - expected_ticks
                                 } else {
@@ -504,9 +510,9 @@ impl Tr101Metrics {
                                 // Calculate error rate (ppm - parts per million)
                                 let error_ppm = (error as f64 / expected_ticks as f64) * 1_000_000.0;
 
-                                // Flag only if error exceeds threshold AND error rate is significant
-                                // This prevents false positives from small timing variations
-                                if error > PCR_ACCURACY_TICKS && error_ppm > 100.0 {
+                                // Only flag severe timing errors (>10ms drift AND >1000ppm error rate)
+                                // This catches real clock skew issues while ignoring network jitter
+                                if error > PCR_ACCURACY_TICKS && error_ppm > 1000.0 {
                                     self.pcr_accuracy_errors = self.pcr_accuracy_errors.saturating_add(1);
                                 }
                             }

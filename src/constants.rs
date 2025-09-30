@@ -9,13 +9,13 @@ pub const PES_START_CODE: [u8; 3] = [0x00, 0x00, 0x01];
 
 /// PCR constants
 pub const PCR_CLOCK_HZ: f64 = 27_000_000.0; // 27 MHz
-pub const PCR_REPETITION_MS: u64 = 40; // Maximum 40ms between PCR
+pub const PCR_REPETITION_MS: u64 = 100; // TR 101 290: Maximum 100ms between PCR
 pub const PCR_WRAP_THRESHOLD: u64 = (1u64 << 33) * 300; // PCR wrap-around point
 
 /// PTS constants
 pub const PTS_CLOCK_HZ: u64 = 90_000; // 90 kHz
 pub const PTS_WRAP_THRESHOLD: u64 = 1u64 << 33; // 33-bit PTS counter
-pub const MAX_PTS_JUMP_SECONDS: u64 = 5; // Maximum allowed PTS jump in seconds
+pub const MAX_PTS_JUMP_SECONDS: u64 = 60; // Maximum allowed PTS jump in seconds (increased for ad insertion/splicing)
 pub const MAX_PTS_JUMP: u64 = PTS_CLOCK_HZ * MAX_PTS_JUMP_SECONDS;
 
 /// TR 101 290 timeout constants (in milliseconds)
