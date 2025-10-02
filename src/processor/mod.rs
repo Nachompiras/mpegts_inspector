@@ -18,6 +18,7 @@ pub struct PacketProcessor {
     pub stats_manager: StatsManager,
     pub si_cache: SiCache,
     pub tr101: Option<Tr101Metrics>,
+    pub total_bytes_processed: u64, // Total bytes processed for PCR accuracy calculation
 }
 
 impl PacketProcessor {
@@ -31,6 +32,7 @@ impl PacketProcessor {
             stats_manager: StatsManager::new(),
             si_cache: SiCache::default(),
             tr101: if enable_tr101 { Some(Tr101Metrics::new()) } else { None },
+            total_bytes_processed: 0,
         }
     }
 
@@ -156,6 +158,9 @@ impl PacketProcessor {
                     }
                 }
 
+                // Update total bytes processed
+                self.total_bytes_processed += chunk.len() as u64;
+
                 // Call optimized TR-101 packet handler
                 let packet_ctx = PacketContext {
                     chunk,
@@ -165,6 +170,7 @@ impl PacketProcessor {
                     pcr_opt: pcr_found,
                     table_id: si_context.table_id,
                     priority_level: analysis_mode.unwrap_or(AnalysisMode::None),
+                    total_bytes_processed: self.total_bytes_processed,
                 };
 
                 let crc_validation = CrcValidation {

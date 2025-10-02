@@ -23,6 +23,7 @@ pub struct PacketContext<'a> {
     pub pcr_opt: Option<(u64, u16)>,
     pub table_id: u8,
     pub priority_level: AnalysisMode,
+    pub total_bytes_processed: u64,  // Total bytes processed since start
 }
 
 /// CRC validation results for all table types
