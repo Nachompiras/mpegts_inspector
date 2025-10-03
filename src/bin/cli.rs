@@ -25,7 +25,7 @@ async fn main() -> anyhow::Result<()> {
     let opt = Opt::parse();
 
     let analysis_mode = if opt.no_analysis {
-        None
+        Some(AnalysisMode::Mux)  // Process SI tables but no TR-101 analysis
     } else {
         match opt.tr101_priority.as_str() {
             "1" => Some(AnalysisMode::Tr101Priority1),
