@@ -29,6 +29,8 @@ struct EsJson<'a> {
 #[derive(Serialize)]
 struct ProgramJson<'a> {
     program: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_name: Option<String>,
     streams: Vec<EsJson<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pcr_pid: Option<u16>,
@@ -48,6 +50,15 @@ struct ReportJson<'a> {
 pub struct Reporter;
 
 impl Reporter {
+    /// Get service name from SDT cache for a program number
+    fn get_service_name(processor: &crate::processor::PacketProcessor, program_number: u16) -> Option<String> {
+        processor.si_cache.sdt.as_ref().and_then(|sdt| {
+            sdt.services.iter()
+                .find(|s| s.service_id == program_number)
+                .and_then(|s| s.service_name.clone())
+        })
+    }
+
     /// Generate a structured InspectorReport for API consumers
     pub fn create_report(
         processor: &crate::processor::PacketProcessor,
@@ -76,12 +87,14 @@ impl Reporter {
                             }
                         }
                     }
-                    // Get PCR PID and PMT version for this program
+                    // Get PCR PID, PMT version, and service name for this program
                     let pcr_pid = processor.get_pcr_pid(*prog_num);
                     let pmt_version = processor.get_pmt_version(pmt_pid);
+                    let service_name = Self::get_service_name(processor, *prog_num);
 
                     programs.push(ProgramInfo {
                         program_number: *prog_num,
+                        service_name,
                         streams,
                         pcr_pid,
                         pmt_version,
@@ -167,12 +180,14 @@ impl Reporter {
                             }
                         }
                     }
-                    // Get PCR PID and PMT version for this program
+                    // Get PCR PID, PMT version, and service name for this program
                     let pcr_pid = processor.get_pcr_pid(*prog_num);
                     let pmt_version = processor.get_pmt_version(pmt_pid);
+                    let service_name = Self::get_service_name(processor, *prog_num);
 
                     programs_out.push(ProgramJson {
                         program: *prog_num,
+                        service_name,
                         streams: es_vec,
                         pcr_pid,
                         pmt_version,
