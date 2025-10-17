@@ -12,6 +12,15 @@ use crate::constants::*;
 /// We use a slightly larger value to account for measurement precision
 const PCR_ACCURACY_TICKS: i64 = 14;
 
+/// PCR tracking information for accuracy validation
+#[derive(Debug, Clone)]
+struct PcrInfo {
+    last_pcr_ticks: u64,
+    last_byte_pos: u64,
+    // Track bitrate samples to establish baseline
+    bitrate_samples: Vec<f64>, // bits per second
+}
+
 #[derive(Default, Debug, Clone,Serialize)]
 pub struct Tr101Metrics {
     // Priority-1 counters
@@ -57,7 +66,7 @@ pub struct Tr101Metrics {
     #[serde(skip)]
     pmt_versions: HashMap<u16, u8>,       // pmt_pid → last version
     #[serde(skip)]
-    last_pcr_info: HashMap<u16, (u64, u64)>, // pid → (pcr_ticks, bytes_since_last_pcr)
+    last_pcr_info: HashMap<u16, PcrInfo>, // pid → PCR tracking info
     #[serde(skip)]
     bytes_in_1s:           u64,
     #[serde(skip)]
@@ -353,20 +362,28 @@ impl Tr101Metrics {
                 // Backward PTS jump - check if it's a wrap-around or legitimate discontinuity
                 let pts_diff = last_pts - pts;
 
-                // Only flag as error if it's a small backward jump (not wrap-around)
-                // Large backward jumps are likely wrap-around or intentional discontinuities
-                // Small backward jumps (< 1 second) indicate real timing errors
-                if pts_diff < 90_000 {  // Less than 1 second backward
-                    self.pts_errors = self.pts_errors.saturating_add(1);
+                // Check if this is a wrap-around (33-bit counter: 0 to 2^33-1)
+                // Wrap occurs when PTS goes from near PTS_WRAP_THRESHOLD back to near 0
+                // If diff is > 75% of wrap point, it's likely a wrap-around
+                let wrap_threshold = (PTS_WRAP_THRESHOLD * 3) / 4; // 75% of max value
+
+                if pts_diff < wrap_threshold {
+                    // Not a wrap - this is a real backward jump
+                    // Only flag small backward jumps (< 1 second) as errors
+                    // Large backward jumps may be intentional discontinuities
+                    if pts_diff < 90_000 {  // Less than 1 second backward
+                        self.pts_errors = self.pts_errors.saturating_add(1);
+                    }
                 }
-                // Wrap-around case: pts_diff is very large (close to PTS_WRAP_THRESHOLD)
-                // This is normal and not an error
+                // else: wrap-around case - this is normal, not an error
             } else {
                 let pts_diff = pts - last_pts;
                 // We no longer flag large forward jumps as errors since they can be
                 // legitimate (ad insertion, stream switching, seeking, etc.)
                 // Only extremely large jumps that suggest data corruption are flagged
-                if pts_diff > MAX_PTS_JUMP && pts_diff < PTS_WRAP_THRESHOLD / 2 {
+                // Must be less than wrap threshold to avoid false positives near wrap point
+                let wrap_threshold = (PTS_WRAP_THRESHOLD * 3) / 4; // 75% of max value
+                if pts_diff > MAX_PTS_JUMP && pts_diff < wrap_threshold {
                     self.pts_errors = self.pts_errors.saturating_add(1);
                 }
             }
@@ -473,16 +490,20 @@ impl Tr101Metrics {
                 match self.last_pcr_info.get_mut(&packet_ctx.pid) {
                     None => {
                         // Initialize: store PCR ticks and current byte position
-                        self.last_pcr_info.insert(packet_ctx.pid, (pcr_ticks, packet_ctx.total_bytes_processed));
+                        self.last_pcr_info.insert(packet_ctx.pid, PcrInfo {
+                            last_pcr_ticks: pcr_ticks,
+                            last_byte_pos: packet_ctx.total_bytes_processed,
+                            bitrate_samples: Vec::new(),
+                        });
                     }
-                    Some((prev_ticks, prev_byte_pos)) => {
+                    Some(prev_info) => {
                         // Handle PCR wrap-around (33-bit counter wraps every ~26.5 hours)
                         const PCR_WRAP: u64 = (1u64 << 33) * 300; // PCR wraps at 2^33 in 90kHz units
-                        let ticks_delta = if pcr_ticks >= *prev_ticks {
-                            pcr_ticks - *prev_ticks
+                        let ticks_delta = if pcr_ticks >= prev_info.last_pcr_ticks {
+                            pcr_ticks - prev_info.last_pcr_ticks
                         } else {
                             // Handle wrap-around
-                            (PCR_WRAP - *prev_ticks) + pcr_ticks
+                            (PCR_WRAP - prev_info.last_pcr_ticks) + pcr_ticks
                         };
 
                         /* 2.4 repetition check */
@@ -494,49 +515,49 @@ impl Tr101Metrics {
                             self.pcr_repetition_errors = self.pcr_repetition_errors.saturating_add(1);
                         }
 
-                        /* 2.5 accuracy check - using byte count method */
-                        // TR 101 290: PCR accuracy should be ±500ns
-                        // We measure this by comparing actual PCR increment vs expected based on bitrate
+                        /* 2.5 accuracy check - proper ±500ns validation */
+                        // TR 101 290: PCR accuracy should be ±500ns (±14 ticks at 27MHz)
+                        // Strategy: Establish baseline bitrate from first samples, then validate
+                        // that subsequent PCRs match the expected timeline within tolerance
 
-                        let bytes_transmitted = packet_ctx.total_bytes_processed - *prev_byte_pos;
+                        let bytes_transmitted = packet_ctx.total_bytes_processed - prev_info.last_byte_pos;
 
                         // Only check accuracy if we have transmitted enough bytes (at least 1KB)
                         // and the time delta is reasonable (10-100ms)
                         if bytes_transmitted >= 1000 && pcr_time_delta_ms >= 10 && pcr_time_delta_ms <= 100 {
-                            // Calculate the actual bitrate from this PCR pair
+                            // Calculate instantaneous bitrate from this PCR pair
                             let bits_transmitted = bytes_transmitted * 8;
                             let seconds_elapsed = ticks_delta as f64 / PCR_CLOCK_HZ;
                             let measured_bitrate = bits_transmitted as f64 / seconds_elapsed;
 
-                            // For the next PCR, we expect the same bitrate
-                            // PCR should increment by: (bits / bitrate) * 27MHz
-                            // But we need at least 3 PCR samples to establish a baseline bitrate
+                            // Store bitrate sample (keep last 10 samples for median calculation)
+                            prev_info.bitrate_samples.push(measured_bitrate);
+                            if prev_info.bitrate_samples.len() > 10 {
+                                prev_info.bitrate_samples.remove(0);
+                            }
 
-                            // For now, we check if the PCR increment matches the byte count
-                            // Expected ticks = (bytes * 8) / bitrate * 27MHz
-                            // Since bitrate = (bytes * 8) / (ticks / 27MHz), this simplifies to:
-                            // The PCR should increment proportionally to bytes transmitted
+                            // Once we have enough samples (≥3), validate PCR accuracy
+                            if prev_info.bitrate_samples.len() >= 3 {
+                                // Calculate median bitrate to avoid outliers
+                                let mut sorted_bitrates = prev_info.bitrate_samples.clone();
+                                sorted_bitrates.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                                let median_bitrate = sorted_bitrates[sorted_bitrates.len() / 2];
 
-                            // Calculate expected PCR based on a nominal mux rate
-                            // Most professional muxers maintain very stable mux rates
-                            // We detect if PCR is drifting from the byte-based timeline
+                                // Calculate expected PCR increment based on median bitrate
+                                // expected_ticks = (bytes * 8) / bitrate * PCR_CLOCK_HZ
+                                let expected_ticks = (bytes_transmitted as f64 * 8.0 / median_bitrate * PCR_CLOCK_HZ) as i64;
+                                let actual_ticks = ticks_delta as i64;
 
-                            // Simplified check: PCR drift per byte should be consistent
-                            let ticks_per_byte = ticks_delta as f64 / bytes_transmitted as f64;
-
-                            // Store this rate for comparison with next PCR
-                            // For now we just check if the rate is reasonable (not implementing full check)
-                            // A typical mux rate of 10 Mbps would give ~21.6 ticks per byte
-                            // We flag only severe deviations that indicate clock problems
-
-                            if ticks_per_byte < 1.0 || ticks_per_byte > 100.0 {
-                                // Unreasonable tick rate suggests timing problems
-                                self.pcr_accuracy_errors = self.pcr_accuracy_errors.saturating_add(1);
+                                // Check if deviation exceeds ±500ns tolerance (±14 ticks)
+                                let deviation = (actual_ticks - expected_ticks).abs();
+                                if deviation > PCR_ACCURACY_TICKS {
+                                    self.pcr_accuracy_errors = self.pcr_accuracy_errors.saturating_add(1);
+                                }
                             }
                         }
 
-                        *prev_ticks = pcr_ticks;
-                        *prev_byte_pos = packet_ctx.total_bytes_processed;
+                        prev_info.last_pcr_ticks = pcr_ticks;
+                        prev_info.last_byte_pos = packet_ctx.total_bytes_processed;
                     }
                 }
             }

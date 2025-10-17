@@ -45,6 +45,7 @@ pub struct VideoInfo {
     pub height: u16,
     pub fps: f32,
     pub chroma: String,
+    pub interlaced: bool,
 }
 
 /// Audio codec information

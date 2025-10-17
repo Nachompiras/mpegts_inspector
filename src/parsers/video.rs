@@ -43,6 +43,7 @@ pub fn parse_mpeg2_seq_hdr(data: &[u8]) -> Option<VideoInfo> {
                     height: vertical_size,
                     fps: fps as f32,
                     chroma: "4:2:0".to_string(), // MPEG-2 is typically 4:2:0
+                    interlaced: false, // MPEG-2 sequence header doesn't provide interlaced info reliably
                 });
             }
         }
@@ -229,6 +230,7 @@ fn parse_avc_sps(raw: &[u8]) -> Option<VideoInfo> {
             _ => "?",
         }
         .to_string(),
+        interlaced: !frame_mbs_only_flag,
     })
 }
 
@@ -244,5 +246,6 @@ fn parse_hevc_sps(raw: &[u8]) -> Option<VideoInfo> {
         height,
         fps: 0.0,
         chroma: String::new(),
+        interlaced: false, // Simplified HEVC parser doesn't detect interlaced
     })
 }
