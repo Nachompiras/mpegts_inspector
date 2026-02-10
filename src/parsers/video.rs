@@ -236,16 +236,260 @@ fn parse_avc_sps(raw: &[u8]) -> Option<VideoInfo> {
 
 fn parse_hevc_sps(raw: &[u8]) -> Option<VideoInfo> {
     let rbsp = remove_emulation_prevention(raw);
-    let mut rdr = BitReader::endian(&rbsp[..], bitstream_io::BigEndian);
-    rdr.skip(4 * 8).ok()?; // skip sps_video_parameter_set_id .. etc
-    let width = ue(&mut rdr)? as u16; // misleading – real parsing needs more, simplified
-    let height = ue(&mut rdr)? as u16;
+    let mut br = BitReader::endian(&rbsp[..], bitstream_io::BigEndian);
+
+    // sps_video_parameter_set_id  u(4)
+    br.skip(4).ok()?;
+    // sps_max_sub_layers_minus1  u(3)
+    let max_sub_layers_minus1 = br.read::<3, u8>().ok()? as u32;
+    // sps_temporal_id_nesting_flag  u(1)
+    br.skip(1).ok()?;
+
+    // ── profile_tier_level( 1, sps_max_sub_layers_minus1 ) ──
+    // General profile: space(2)+tier(1)+idc(5)+compat(32)+constraints(48) = 88 bits
+    br.skip(88).ok()?;
+    // general_level_idc  u(8)
+    br.skip(8).ok()?;
+
+    // Sub-layer present flags
+    let mut sub_layer_profile_present = [false; 8];
+    let mut sub_layer_level_present = [false; 8];
+    for i in 0..max_sub_layers_minus1 as usize {
+        sub_layer_profile_present[i] = br.read::<1, u8>().ok()? != 0;
+        sub_layer_level_present[i] = br.read::<1, u8>().ok()? != 0;
+    }
+    if max_sub_layers_minus1 > 0 {
+        for _ in max_sub_layers_minus1..8 {
+            br.skip(2).ok()?; // reserved_zero_2bits
+        }
+    }
+    for i in 0..max_sub_layers_minus1 as usize {
+        if sub_layer_profile_present[i] {
+            br.skip(88).ok()?; // sub_layer profile (same structure as general)
+        }
+        if sub_layer_level_present[i] {
+            br.skip(8).ok()?; // sub_layer_level_idc
+        }
+    }
+    // ── end profile_tier_level ──
+
+    // sps_seq_parameter_set_id
+    ue(&mut br)?;
+
+    // chroma_format_idc
+    let chroma_format_idc = ue(&mut br)?;
+    if chroma_format_idc == 3 {
+        br.skip(1).ok()?; // separate_colour_plane_flag
+    }
+
+    // pic_width_in_luma_samples, pic_height_in_luma_samples
+    let pic_w = ue(&mut br)?;
+    let pic_h = ue(&mut br)?;
+
+    // conformance_window_flag
+    let (width, height) = if br.read::<1, u8>().ok()? != 0 {
+        let l = ue(&mut br)?;
+        let r = ue(&mut br)?;
+        let t = ue(&mut br)?;
+        let b = ue(&mut br)?;
+        let (sub_w, sub_h) = match chroma_format_idc {
+            1 => (2u32, 2u32),
+            2 => (2, 1),
+            _ => (1, 1),
+        };
+        (pic_w.saturating_sub(sub_w * (l + r)), pic_h.saturating_sub(sub_h * (t + b)))
+    } else {
+        (pic_w, pic_h)
+    };
+
+    let chroma = match chroma_format_idc {
+        0 => "4:0:0", 1 => "4:2:0", 2 => "4:2:2", 3 => "4:4:4", _ => "?",
+    }.to_string();
+
+    // Best-effort: parse remaining SPS fields to reach VUI for FPS
+    let fps = hevc_parse_to_vui_fps(&mut br, max_sub_layers_minus1).unwrap_or(0.0);
+
     Some(VideoInfo {
         codec: "HEVC".to_string(),
-        width,
-        height,
-        fps: 0.0,
-        chroma: String::new(),
-        interlaced: false, // Simplified HEVC parser doesn't detect interlaced
+        width: width as u16,
+        height: height as u16,
+        fps,
+        chroma,
+        interlaced: false,
     })
+}
+
+/// Best-effort parsing of remaining HEVC SPS fields to extract FPS from VUI.
+/// Returns None if parsing fails at any point (PTS-based FPS will be used instead).
+fn hevc_parse_to_vui_fps<R: std::io::Read>(
+    br: &mut BitReader<R, BigEndian>,
+    max_sub_layers_minus1: u32,
+) -> Option<f32> {
+    // bit_depth_luma_minus8, bit_depth_chroma_minus8
+    ue(br)?;
+    ue(br)?;
+    // log2_max_pic_order_cnt_lsb_minus4
+    let log2_max_poc_lsb_minus4 = ue(br)?;
+
+    // sps_sub_layer_ordering_info_present_flag
+    let ordering_present = br.read::<1, u8>().ok()? != 0;
+    let start = if ordering_present { 0 } else { max_sub_layers_minus1 };
+    for _ in start..=max_sub_layers_minus1 {
+        ue(br)?; // max_dec_pic_buffering_minus1
+        ue(br)?; // max_num_reorder_pics
+        ue(br)?; // max_latency_increase_plus1
+    }
+
+    // 6 ue values: coding/transform block sizes + transform hierarchy depths
+    for _ in 0..6 { ue(br)?; }
+
+    // scaling_list_enabled_flag
+    if br.read::<1, u8>().ok()? != 0
+        && br.read::<1, u8>().ok()? != 0
+    {
+        hevc_skip_scaling_list_data(br)?;
+    }
+
+    // amp_enabled_flag + sample_adaptive_offset_enabled_flag
+    br.skip(2).ok()?;
+
+    // pcm_enabled_flag
+    if br.read::<1, u8>().ok()? != 0 {
+        br.skip(8).ok()?; // pcm bit depths (4+4)
+        ue(br)?; // log2_min_pcm_luma_coding_block_size_minus3
+        ue(br)?; // log2_diff_max_min_pcm_luma_coding_block_size
+        br.skip(1).ok()?; // pcm_loop_filter_disabled_flag
+    }
+
+    // num_short_term_ref_pic_sets
+    let num_st_rps = ue(br)? as usize;
+    let mut num_delta_pocs = vec![0u32; num_st_rps];
+    for idx in 0..num_st_rps {
+        hevc_skip_st_ref_pic_set(br, idx, &mut num_delta_pocs)?;
+    }
+
+    // long_term_ref_pics_present_flag
+    if br.read::<1, u8>().ok()? != 0 {
+        let num_lt = ue(br)?;
+        let lt_bits = log2_max_poc_lsb_minus4 + 4;
+        for _ in 0..num_lt {
+            br.skip(lt_bits).ok()?; // lt_ref_pic_poc_lsb_sps
+            br.skip(1).ok()?; // used_by_curr_pic_lt_sps_flag
+        }
+    }
+
+    // sps_temporal_mvp_enabled_flag + strong_intra_smoothing_enabled_flag
+    br.skip(2).ok()?;
+
+    // vui_parameters_present_flag
+    if br.read::<1, u8>().ok()? == 0 {
+        return None;
+    }
+
+    // ── VUI parameters: skip to timing info ──
+    if br.read::<1, u8>().ok()? != 0 { // aspect_ratio_info_present_flag
+        if br.read::<8, u8>().ok()? == 255 { // Extended_SAR
+            br.skip(32).ok()?; // sar_width + sar_height
+        }
+    }
+    if br.read::<1, u8>().ok()? != 0 { // overscan_info_present_flag
+        br.skip(1).ok()?;
+    }
+    if br.read::<1, u8>().ok()? != 0 { // video_signal_type_present_flag
+        br.skip(4).ok()?; // video_format(3) + full_range(1)
+        if br.read::<1, u8>().ok()? != 0 { // colour_description_present_flag
+            br.skip(24).ok()?; // primaries + transfer + matrix
+        }
+    }
+    if br.read::<1, u8>().ok()? != 0 { // chroma_loc_info_present_flag
+        ue(br)?; ue(br)?;
+    }
+    // neutral_chroma + field_seq + frame_field_info_present
+    br.skip(3).ok()?;
+    if br.read::<1, u8>().ok()? != 0 { // default_display_window_flag
+        ue(br)?; ue(br)?; ue(br)?; ue(br)?;
+    }
+
+    // vui_timing_info_present_flag
+    if br.read::<1, u8>().ok()? != 0 {
+        let num_units_in_tick = br.read::<32, u32>().ok()?;
+        let time_scale = br.read::<32, u32>().ok()?;
+        if num_units_in_tick > 0 && time_scale > 0 {
+            let fps = time_scale as f32 / num_units_in_tick as f32;
+            if (1.0..=240.0).contains(&fps) {
+                return Some(fps);
+            }
+        }
+    }
+
+    None
+}
+
+/// Skip HEVC scaling_list_data() in the bitstream
+fn hevc_skip_scaling_list_data<R: std::io::Read>(
+    br: &mut BitReader<R, BigEndian>,
+) -> Option<()> {
+    for size_id in 0u32..4 {
+        let step: u32 = if size_id == 3 { 3 } else { 1 };
+        let mut matrix_id = 0u32;
+        while matrix_id < 6 {
+            if br.read::<1, u8>().ok()? == 0 { // scaling_list_pred_mode_flag
+                ue(br)?; // pred_matrix_id_delta
+            } else {
+                let coef_num = 64u32.min(1u32 << (4 + (size_id << 1)));
+                if size_id > 1 {
+                    se(br)?; // scaling_list_dc_coef_minus8
+                }
+                for _ in 0..coef_num {
+                    se(br)?; // scaling_list_delta_coef
+                }
+            }
+            matrix_id += step;
+        }
+    }
+    Some(())
+}
+
+/// Skip one HEVC short_term_ref_pic_set and track num_delta_pocs
+fn hevc_skip_st_ref_pic_set<R: std::io::Read>(
+    br: &mut BitReader<R, BigEndian>,
+    idx: usize,
+    num_delta_pocs: &mut [u32],
+) -> Option<()> {
+    let inter = if idx != 0 {
+        br.read::<1, u8>().ok()? != 0
+    } else {
+        false
+    };
+
+    if inter {
+        // delta_idx_minus1 is always 0 in SPS context
+        br.skip(1).ok()?; // delta_rps_sign
+        ue(br)?; // abs_delta_rps_minus1
+        let ref_num = num_delta_pocs[idx - 1];
+        let mut count = 0u32;
+        for _ in 0..=ref_num {
+            let used = br.read::<1, u8>().ok()? != 0;
+            if !used {
+                if br.read::<1, u8>().ok()? != 0 { count += 1; }
+            } else {
+                count += 1;
+            }
+        }
+        num_delta_pocs[idx] = count;
+    } else {
+        let num_neg = ue(br)?;
+        let num_pos = ue(br)?;
+        for _ in 0..num_neg {
+            ue(br)?; // delta_poc_s0_minus1
+            br.skip(1).ok()?; // used_by_curr_pic_s0_flag
+        }
+        for _ in 0..num_pos {
+            ue(br)?; // delta_poc_s1_minus1
+            br.skip(1).ok()?; // used_by_curr_pic_s1_flag
+        }
+        num_delta_pocs[idx] = num_neg + num_pos;
+    }
+
+    Some(())
 }
