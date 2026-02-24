@@ -75,6 +75,8 @@ impl PacketProcessor {
         let payload_unit_start = chunk[1] & 0x40 != 0;
         let adaption_field_ctrl = (chunk[3] & 0x30) >> 4;
         let mut payload_offset = 4usize;
+        let has_adaptation = adaption_field_ctrl & 0x02 != 0;
+        let has_payload = adaption_field_ctrl & 0x01 != 0;
 
         // Check for PID errors (unexpected/undeclared PIDs)
         if let Some(ref mut tr101) = self.tr101 {
@@ -87,27 +89,21 @@ impl PacketProcessor {
             ..Default::default()
         };
 
-        // Skip packets with no payload or adaptation field only
-        if adaption_field_ctrl == 2 || adaption_field_ctrl == 0 {
+        // Reserved value (adaption_field_ctrl == 0): skip entirely
+        if adaption_field_ctrl == 0 {
             return;
         }
 
-        // Handle adaptation field
-        if adaption_field_ctrl == 3 {
-            let adap_len = chunk[4] as usize;
-            payload_offset += 1 + adap_len;
-            if payload_offset >= 188 {
-                return;
-            }
-        }
-
-        // Extract PCR if present and this PID is a designated PCR PID
+        // Extract PCR from adaptation field (before any early return)
+        // PCR can be in adaptation-only packets (adaption_field_ctrl == 2)
         let mut pcr_found: Option<(u64, u16)> = None;
-        let is_pcr_pid = self.pcr_pid_map.values().any(|&pcr_pid| pcr_pid == pid);
-
-        if adaption_field_ctrl & 0x02 != 0 && payload_offset > 4 && is_pcr_pid {
+        if has_adaptation {
             let ad_len = chunk[4] as usize;
-            if ad_len >= 7 && chunk[5] & 0x10 != 0 { // PCR_flag
+            payload_offset = 4 + 1 + ad_len;
+
+            // Extract PCR if present and this PID is a designated PCR PID
+            let is_pcr_pid = self.pcr_pid_map.values().any(|&pcr_pid| pcr_pid == pid);
+            if is_pcr_pid && ad_len >= 7 && chunk[5] & 0x10 != 0 { // PCR_flag
                 let p = &chunk[6..12];
                 let base = ((p[0] as u64) << 25)
                         | ((p[1] as u64) << 17)
@@ -119,15 +115,7 @@ impl PacketProcessor {
             }
         }
 
-        let payload = &chunk[payload_offset..];
-
-        // Only process SI tables if in analysis mode (any TR-101 level or Mux)
-        if matches!(analysis_mode, Some(AnalysisMode::Mux) | Some(AnalysisMode::Tr101) | Some(AnalysisMode::Tr101Priority1) | Some(AnalysisMode::Tr101Priority12)) {
-            self.process_si_tables(pid, payload_unit_start, payload, &mut si_context, analysis_mode);
-            self.process_elementary_streams(pid, payload_unit_start, payload, analysis_mode);
-        }
-
-        // TR-101 analysis if enabled
+        // TR-101 analysis runs for ALL packets (including adaptation-only)
         if matches!(analysis_mode, Some(AnalysisMode::Tr101) | Some(AnalysisMode::Tr101Priority1) | Some(AnalysisMode::Tr101Priority12)) {
             if let Some(ref mut tr101) = self.tr101 {
                 // Check for service ID mismatch - Priority 3
@@ -136,13 +124,16 @@ impl PacketProcessor {
                 }
 
                 // Handle splice_countdown in adaptation field - Priority 3
-                if matches!(analysis_mode, Some(AnalysisMode::Tr101)) && adaption_field_ctrl & 0x02 != 0 && payload_offset > 4 {
+                if matches!(analysis_mode, Some(AnalysisMode::Tr101)) && has_adaptation {
                     let ad_len = chunk[4] as usize;
                     if ad_len >= 1 {
                         let flags = chunk[5];
                         if flags & 0x04 != 0 {
-                            // splice_countdown present
-                            let sc_pos = 6 + ad_len - 1;
+                            // Calculate splice_countdown position dynamically
+                            let mut sc_pos = 6usize;
+                            if flags & 0x10 != 0 { sc_pos += 6; } // PCR (6 bytes)
+                            if flags & 0x08 != 0 { sc_pos += 6; } // OPCR (6 bytes)
+                            // splice_countdown is next (1 byte)
                             if sc_pos < chunk.len() {
                                 let val = chunk[sc_pos] as i8;
                                 match tr101.last_splice_value {
@@ -187,6 +178,19 @@ impl PacketProcessor {
                 tr101.on_packet_with_context(packet_ctx, crc_validation);
             }
         }
+
+        // No payload to process: stop here (adaptation-only packets)
+        if !has_payload || payload_offset >= 188 {
+            return;
+        }
+
+        let payload = &chunk[payload_offset..];
+
+        // Only process SI tables if in analysis mode (any TR-101 level or Mux)
+        if matches!(analysis_mode, Some(AnalysisMode::Mux) | Some(AnalysisMode::Tr101) | Some(AnalysisMode::Tr101Priority1) | Some(AnalysisMode::Tr101Priority12)) {
+            self.process_si_tables(pid, payload_unit_start, payload, &mut si_context, analysis_mode);
+            self.process_elementary_streams(pid, payload_unit_start, payload, analysis_mode);
+        }
     }
 
     fn process_si_tables(
@@ -198,7 +202,7 @@ impl PacketProcessor {
         analysis_mode: Option<AnalysisMode>,
     ) {
         // Determine if this PID carries a SI/PSI table that needs assembly
-        let is_psi_pid = matches!(pid, 0x0000 | 0x0001 | 0x0010 | 0x0011 | 0x0014)
+        let is_psi_pid = matches!(pid, 0x0000 | 0x0001 | 0x0010 | 0x0011 | 0x0012 | 0x0014)
             || self.pat_map.values().any(|p| p.programs.iter().any(|e| e.pmt_pid == pid));
 
         if !is_psi_pid {
@@ -270,26 +274,26 @@ impl PacketProcessor {
                 }
             }
 
-            // SDT/EIT (PID 0x0011)
+            // SDT/BAT (PID 0x0011)
             0x0011 => {
-                let mut handled = false;
-                if context.sdt_crc_ok.is_none() {
-                    if let Ok((tid, sdt)) = parse_sdt(parse_buf) {
+                match parse_sdt(parse_buf) {
+                    Ok((tid, sdt)) => {
                         context.sdt_crc_ok = Some(true);
                         context.table_id = tid;
                         self.si_cache.update_sdt(sdt);
-                        handled = true;
                     }
+                    Err(_) => { context.sdt_crc_ok = Some(false); }
                 }
+            }
 
-                if !handled {
-                    match parse_eit_pf(parse_buf) {
-                        Ok((tid, _eit)) => {
-                            context.eit_crc_ok = Some(true);
-                            context.table_id = tid;
-                        }
-                        Err(_) => { /* may be TOT/TDT or CRC error -> ignore */ }
+            // EIT (PID 0x0012)
+            0x0012 => {
+                match parse_eit_pf(parse_buf) {
+                    Ok((tid, _eit)) => {
+                        context.eit_crc_ok = Some(true);
+                        context.table_id = tid;
                     }
+                    Err(_) => { context.eit_crc_ok = Some(false); }
                 }
             }
 

@@ -95,46 +95,65 @@ pub fn parse_mp2(data: &[u8]) -> Option<AudioInfo> {
 /// Parse AC-3 sync frame header
 pub fn parse_ac3(data: &[u8]) -> Option<AudioInfo> {
     // AC-3 sync frame starts with 0x0B77
-    for i in 0..data.len().saturating_sub(5) {
+    for i in 0..data.len().saturating_sub(8) {
         if data[i] == 0x0B && data[i + 1] == 0x77 {
-            // Basic AC-3 frame found
-            if i + 4 < data.len() {
-                let fscod = (data[i + 4] >> 6) & 0x03;
-                let acmod = (data[i + 6] >> 5) & 0x07;
-
-                let sample_rate = match fscod {
-                    0x00 => 48000,
-                    0x01 => 44100,
-                    0x02 => 32000,
-                    _ => 0,
-                };
-
-                let channels = match acmod {
-                    0x00 => 2, // 1+1 (dual mono)
-                    0x01 => 1, // 1/0 (mono)
-                    0x02 => 2, // 2/0 (stereo)
-                    0x03 => 3, // 3/0
-                    0x04 => 3, // 2/1
-                    0x05 => 4, // 3/1
-                    0x06 => 4, // 2/2
-                    0x07 => 5, // 3/2
-                    _ => 2,
-                };
-
-                // Check for LFE channel
-                let lfe = if acmod == 0x01 { // mono doesn't use lfeon bit
-                    false
-                } else {
-                    (data[i + 6] >> 4) & 0x01 == 1
-                };
-
-                return Some(AudioInfo {
-                    codec: "AC-3".to_string(),
-                    profile: None,
-                    sample_rate: Some(sample_rate),
-                    channels: Some(channels + if lfe { 1 } else { 0 }),
-                });
+            // AC-3 frame layout (ATSC A/52):
+            //   byte 0-1: syncword (0x0B77)
+            //   byte 2-3: crc1
+            //   byte 4:   fscod(2) + frmsizecod(6)
+            //   byte 5:   bsid(5) + bsmod(3)
+            //   byte 6:   acmod(3) + [cmixlev(2)] + [surmixlev(2)] + lfeon(1) + ...
+            if i + 7 >= data.len() {
+                continue;
             }
+
+            let fscod = (data[i + 4] >> 6) & 0x03;
+            let acmod = (data[i + 6] >> 5) & 0x07;
+
+            let sample_rate = match fscod {
+                0x00 => 48000,
+                0x01 => 44100,
+                0x02 => 32000,
+                _ => 0,
+            };
+
+            let channels = match acmod {
+                0x00 => 2, // 1+1 (dual mono)
+                0x01 => 1, // 1/0 (mono)
+                0x02 => 2, // 2/0 (stereo)
+                0x03 => 3, // 3/0
+                0x04 => 3, // 2/1
+                0x05 => 4, // 3/1
+                0x06 => 4, // 2/2
+                0x07 => 5, // 3/2
+                _ => 2,
+            };
+
+            // The lfeon bit position in byte 6 depends on acmod, because
+            // cmixlev (2 bits) and surmixlev (2 bits) are conditionally present.
+            // After acmod (3 bits from bit 7), the layout is:
+            //   [cmixlev(2)] if center channel present: (acmod & 0x01) != 0 && acmod != 0x01
+            //   [surmixlev(2)] if surround channels present: acmod & 0x04 != 0
+            //   lfeon(1)
+            let mut bit_pos = 5u8; // start after acmod (3 bits used from MSB of byte 6)
+            let has_center = (acmod & 0x01) != 0 && acmod != 0x01;
+            let has_surround = (acmod & 0x04) != 0;
+            if has_center { bit_pos -= 2; }   // cmixlev: 2 bits
+            if has_surround { bit_pos -= 2; } // surmixlev: 2 bits
+            // lfeon is at bit_pos, but may overflow into byte 7
+            let lfe = if bit_pos > 0 {
+                (data[i + 6] >> (bit_pos - 1)) & 0x01 == 1
+            } else {
+                // lfeon is in the MSB of the next byte
+                (data[i + 7] >> 7) & 0x01 == 1
+            };
+
+            return Some(AudioInfo {
+                codec: "AC-3".to_string(),
+                profile: None,
+                sample_rate: Some(sample_rate),
+                channels: Some(channels + if lfe { 1 } else { 0 }),
+            });
         }
     }
     None

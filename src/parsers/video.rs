@@ -181,13 +181,15 @@ fn parse_avc_sps(raw: &[u8]) -> Option<VideoInfo> {
             // timing_info_present_flag
             let num_units_in_tick = br.read::<32, u32>().ok()?;
             let time_scale = br.read::<32, u32>().ok()?;
-            let fixed_frame_rate_flag = br.read::<1, u8>().ok()? != 0;
+            let _fixed_frame_rate_flag = br.read::<1, u8>().ok()? != 0;
 
             if num_units_in_tick > 0 && time_scale > 0 {
-                // For progressive video, divide by 2
-                // For interlaced video (field-based), don't divide by 2
-                let divisor = if fixed_frame_rate_flag { 2.0 } else { 1.0 };
-                fps = (time_scale as f32) / (num_units_in_tick as f32 * divisor);
+                // Per ISO/IEC 14496-10: time_scale / (2 * num_units_in_tick) gives
+                // the frame rate. The division by 2 is always needed because
+                // num_units_in_tick represents clock ticks per field (2 fields per frame).
+                // fixed_frame_rate_flag only indicates whether the rate is constant,
+                // NOT whether to divide by 2.
+                fps = (time_scale as f32) / (num_units_in_tick as f32 * 2.0);
 
                 // Sanity check: FPS should be reasonable (1-120 fps)
                 if !(1.0..=120.0).contains(&fps) {

@@ -92,7 +92,7 @@ pub async fn run_broadcast_with_control(
     refresh_secs: u64,
     initial_mode: Option<AnalysisMode>,
 ) -> anyhow::Result<()> {
-    let mut processor = PacketProcessor::new(matches!(initial_mode, Some(AnalysisMode::Tr101)));
+    let mut processor = PacketProcessor::new(matches!(initial_mode, Some(AnalysisMode::Tr101) | Some(AnalysisMode::Tr101Priority1) | Some(AnalysisMode::Tr101Priority12)));
     let mut current_mode = initial_mode;
     let mut last_print = Instant::now();
 

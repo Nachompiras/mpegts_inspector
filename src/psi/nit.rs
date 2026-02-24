@@ -23,15 +23,25 @@ pub fn parse_nit(payload: &[u8]) -> anyhow::Result<(u8, NitSection)> {
     }
 
     let b = sec.body;                 // shorthand – already stripped CRC
-    if b.len() < 8 {
+    if b.len() < 2 {
         anyhow::bail!("NIT body too short");
     }
 
-    let network_id = u16::from_be_bytes([b[0], b[1]]);
-    let net_desc_len = (((b[2] & 0x0F) as usize) << 8) | b[3] as usize;
+    // NIT body after common section header (8 bytes consumed by SectionReader):
+    //   reserved_future_use(4 bits) + network_descriptors_length(12 bits) → b[0..2]
+    //   network_descriptor() loop → b[2..2+net_desc_len]
+    //   reserved_future_use(4 bits) + transport_stream_loop_length(12 bits) → 2 bytes
+    //   transport_stream() loop
+    // network_id is already in sec.program_number (table_id_extension)
+    let network_id = sec.program_number;
+    let net_desc_len = (((b[0] & 0x0F) as usize) << 8) | b[1] as usize;
 
-    let mut idx = 4 + net_desc_len;   // skip network-descriptors
-    if idx > b.len() { anyhow::bail!("truncated network descriptors"); }
+    let mut idx = 2 + net_desc_len;   // skip network-descriptors
+    if idx + 2 > b.len() { anyhow::bail!("truncated network descriptors"); }
+
+    // Skip transport_stream_loop_length (2 bytes)
+    let _ts_loop_len = (((b[idx] & 0x0F) as usize) << 8) | b[idx + 1] as usize;
+    idx += 2;
 
     let mut transports = Vec::new();
     while idx + 6 <= b.len() {

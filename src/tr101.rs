@@ -608,16 +608,16 @@ impl Tr101Metrics {
                     if let Some(ok) = crc_validation.nit_crc_ok { if !ok { self.nit_crc_errors += 1; } }
                     self.last_nit_seen = Some(now);
                 }
-                0x0011 => {          // SDT / EIT
-                    if packet_ctx.table_id == 0x42 || packet_ctx.table_id == 0x46 { // SDT
-                        if let Some(ok) = crc_validation.sdt_crc_ok { if !ok { self.sdt_crc_errors += 1; } }
-                        self.last_sdt_seen = Some(now);
-                    } else if packet_ctx.table_id == 0x4E || packet_ctx.table_id == 0x4F { // EIT p/f
-                        if let Some(ok) = crc_validation.eit_crc_ok { if !ok { self.eit_crc_errors += 1; } }
-                        self.last_eit_seen = Some(now);
-                    } else if packet_ctx.table_id == 0x70 || packet_ctx.table_id == 0x73 { // TDT/TOT
-                        self.last_tdt_seen = Some(now);
-                    }
+                0x0011 => {          // SDT/BAT
+                    if let Some(ok) = crc_validation.sdt_crc_ok { if !ok { self.sdt_crc_errors += 1; } }
+                    self.last_sdt_seen = Some(now);
+                }
+                0x0012 => {          // EIT
+                    if let Some(ok) = crc_validation.eit_crc_ok { if !ok { self.eit_crc_errors += 1; } }
+                    self.last_eit_seen = Some(now);
+                }
+                0x0014 => {          // TDT/TOT
+                    self.last_tdt_seen = Some(now);
                 }
                 _ => {}
             }

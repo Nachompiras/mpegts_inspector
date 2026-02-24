@@ -17,15 +17,17 @@ pub fn parse_sdt(payload: &[u8]) -> anyhow::Result<(u8, SdtSection)> {
     }
 
     let b = sec.body;
-    if b.len() < 8 {
+    if b.len() < 3 {
         anyhow::bail!("SDT body too short");
     }
 
-    // Fixed header inside SDT body
-    let _transport_stream_id = u16::from_be_bytes([b[0], b[1]]);
-    let _original_net_id     = u16::from_be_bytes([b[6], b[7]]);
+    // SDT body after common section header (8 bytes consumed by SectionReader):
+    //   original_network_id (2 bytes)  → b[0..2]
+    //   reserved_future_use (1 byte)   → b[2]
+    //   service loop                   → b[3+]
+    let _original_net_id = u16::from_be_bytes([b[0], b[1]]);
 
-    let mut idx = 8;                              // start of service loop
+    let mut idx = 3;                              // start of service loop
     let mut services = Vec::new();
 
     while idx + 5 <= b.len() {
