@@ -118,11 +118,6 @@ impl PacketProcessor {
         // TR-101 analysis runs for ALL packets (including adaptation-only)
         if matches!(analysis_mode, Some(AnalysisMode::Tr101) | Some(AnalysisMode::Tr101Priority1) | Some(AnalysisMode::Tr101Priority12)) {
             if let Some(ref mut tr101) = self.tr101 {
-                // Check for service ID mismatch - Priority 3
-                if matches!(analysis_mode, Some(AnalysisMode::Tr101)) && self.si_cache.check_service_id_mismatch() {
-                    tr101.service_id_mismatch += 1;
-                }
-
                 // Handle splice_countdown in adaptation field - Priority 3
                 if matches!(analysis_mode, Some(AnalysisMode::Tr101)) && has_adaptation {
                     let ad_len = chunk[4] as usize;
@@ -244,6 +239,15 @@ impl PacketProcessor {
                         for entry in &pat.programs {
                             self.pat_map.insert(entry.program_number, pat.clone());
                         }
+
+                        // Check service ID mismatch after PAT update (Priority 3)
+                        if matches!(analysis_mode, Some(AnalysisMode::Tr101)) {
+                            if let Some(ref mut tr101) = self.tr101 {
+                                if self.si_cache.check_service_id_mismatch() {
+                                    tr101.service_id_mismatch += 1;
+                                }
+                            }
+                        }
                     }
                     Err(_) => { context.pat_crc_ok = Some(false); }
                 }
@@ -281,6 +285,15 @@ impl PacketProcessor {
                         context.sdt_crc_ok = Some(true);
                         context.table_id = tid;
                         self.si_cache.update_sdt(sdt);
+
+                        // Check service ID mismatch after SDT update (Priority 3)
+                        if matches!(analysis_mode, Some(AnalysisMode::Tr101)) {
+                            if let Some(ref mut tr101) = self.tr101 {
+                                if self.si_cache.check_service_id_mismatch() {
+                                    tr101.service_id_mismatch += 1;
+                                }
+                            }
+                        }
                     }
                     Err(_) => { context.sdt_crc_ok = Some(false); }
                 }

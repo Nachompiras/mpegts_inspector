@@ -6,6 +6,11 @@ use crate::types::AudioInfo;
 pub fn parse_aac_adts(data: &[u8]) -> Option<AudioInfo> {
     for i in 0..data.len().saturating_sub(7) {
         if data[i] == 0xFF && (data[i + 1] & 0xF6) == 0xF0 {
+            // ADTS header layout:
+            //   byte 0-1: syncword(12) + ID(1) + layer(2) + protection(1)
+            //   byte 2:   profile(2) + sampling_freq_index(4) + private(1) + channel_config[2](1)
+            //   byte 3:   channel_config[1:0](2) + ...
+            let profile_index = (data[i + 2] >> 6) & 0x03;
             let sr_index = (data[i + 2] & 0x3C) >> 2;
             let channel_cfg = ((data[i + 2] & 0x01) << 2) | ((data[i + 3] & 0xC0) >> 6);
             let sample_rate = match sr_index {
@@ -23,9 +28,17 @@ pub fn parse_aac_adts(data: &[u8]) -> Option<AudioInfo> {
                 11 => 8000,
                 _ => 0,
             };
+            // ADTS profile field is audioObjectType - 1
+            let profile = match profile_index {
+                0 => "Main",
+                1 => "LC",
+                2 => "SSR",
+                3 => "LTP",
+                _ => "LC",
+            };
             return Some(AudioInfo {
                 codec: "AAC".to_string(),
-                profile: Some("LC".to_string()),
+                profile: Some(profile.to_string()),
                 sample_rate: Some(sample_rate),
                 channels: Some(channel_cfg),
             });

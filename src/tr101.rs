@@ -7,18 +7,18 @@ use crate::types::{PacketContext, CrcValidation};
 use crate::constants::*;
 
 // Local constants specific to TR-101 implementation
-/// PCR accuracy tolerance as specified in TR 101 290
-/// ±500 ns = 27,000,000 * 500e-9 ≈ 13.5 ticks
-/// We use a slightly larger value to account for measurement precision
-const PCR_ACCURACY_TICKS: i64 = 14;
+/// PCR accuracy tolerance for software-based checking.
+/// TR 101 290 specifies ±500ns (≈14 ticks at 27MHz), but a software receiver
+/// cannot achieve that precision due to system timer granularity and network jitter.
+/// We use ±100µs (2700 ticks) as a practical threshold for detecting real PCR drift
+/// while avoiding false positives from measurement noise.
+const PCR_ACCURACY_TICKS: i64 = 2700;
 
 /// PCR tracking information for accuracy validation
 #[derive(Debug, Clone)]
 struct PcrInfo {
     last_pcr_ticks: u64,
-    last_byte_pos: u64,
-    // Track bitrate samples to establish baseline
-    bitrate_samples: Vec<f64>, // bits per second
+    last_wall_time: Instant,
 }
 
 #[derive(Default, Debug, Clone,Serialize)]
@@ -94,6 +94,14 @@ pub struct Tr101Metrics {
     #[serde(skip)]
     cat_timeout_state: bool,  // Track if CAT is currently in timeout state
     #[serde(skip)]
+    nit_timeout_state: bool,  // Track NIT timeout state
+    #[serde(skip)]
+    sdt_timeout_state: bool,  // Track SDT timeout state
+    #[serde(skip)]
+    eit_timeout_state: bool,  // Track EIT timeout state
+    #[serde(skip)]
+    tdt_timeout_state: bool,  // Track TDT timeout state
+    #[serde(skip)]
     known_pids: std::collections::HashSet<u16>,  // PIDs that are authorized/expected
     #[serde(skip)]
     last_pts_per_pid: HashMap<u16, u64>,  // Track last PTS per PID for discontinuity detection
@@ -109,6 +117,10 @@ impl Tr101Metrics {
             pat_timeout_state: false,
             pmt_timeout_state: HashMap::new(),
             cat_timeout_state: false,
+            nit_timeout_state: false,
+            sdt_timeout_state: false,
+            eit_timeout_state: false,
+            tdt_timeout_state: false,
             ..Self::default()
         }
     }
@@ -166,6 +178,10 @@ impl Tr101Metrics {
             pat_timeout_state: self.pat_timeout_state,
             pmt_timeout_state: self.pmt_timeout_state.clone(),
             cat_timeout_state: self.cat_timeout_state,
+            nit_timeout_state: self.nit_timeout_state,
+            sdt_timeout_state: self.sdt_timeout_state,
+            eit_timeout_state: self.eit_timeout_state,
+            tdt_timeout_state: self.tdt_timeout_state,
             known_pids: self.known_pids.clone(),
             last_pts_per_pid: self.last_pts_per_pid.clone(),
             sync_loss_counter: self.sync_loss_counter,
@@ -227,6 +243,10 @@ impl Tr101Metrics {
             pat_timeout_state: self.pat_timeout_state,
             pmt_timeout_state: self.pmt_timeout_state.clone(),
             cat_timeout_state: self.cat_timeout_state,
+            nit_timeout_state: self.nit_timeout_state,
+            sdt_timeout_state: self.sdt_timeout_state,
+            eit_timeout_state: self.eit_timeout_state,
+            tdt_timeout_state: self.tdt_timeout_state,
             known_pids: self.known_pids.clone(),
             last_pts_per_pid: self.last_pts_per_pid.clone(),
             sync_loss_counter: self.sync_loss_counter,
@@ -471,6 +491,20 @@ impl Tr101Metrics {
                     }
                     self.pmt_timeout_state.insert(pmt_pid, is_timeout);
                 }
+
+                // Check CAT timeout (Priority 2) - only if CAT has been seen at least once
+                if matches!(packet_ctx.priority_level, crate::types::AnalysisMode::Tr101 | crate::types::AnalysisMode::Tr101Priority12) {
+                    if self.last_cat_seen.is_some() {
+                        let was_timeout = self.cat_timeout_state;
+                        let is_timeout = self.last_cat_seen.is_none_or(|last|
+                            last.elapsed() > Duration::from_millis(CAT_TIMEOUT_MS)
+                        );
+                        if is_timeout && !was_timeout {
+                            self.cat_timeout = self.cat_timeout.saturating_add(1);
+                        }
+                        self.cat_timeout_state = is_timeout;
+                    }
+                }
             }
         }
 
@@ -489,11 +523,10 @@ impl Tr101Metrics {
 
                 match self.last_pcr_info.get_mut(&packet_ctx.pid) {
                     None => {
-                        // Initialize: store PCR ticks and current byte position
+                        // Initialize: store PCR ticks and wall-clock time
                         self.last_pcr_info.insert(packet_ctx.pid, PcrInfo {
                             last_pcr_ticks: pcr_ticks,
-                            last_byte_pos: packet_ctx.total_bytes_processed,
-                            bitrate_samples: Vec::new(),
+                            last_wall_time: now,
                         });
                     }
                     Some(prev_info) => {
@@ -515,49 +548,28 @@ impl Tr101Metrics {
                             self.pcr_repetition_errors = self.pcr_repetition_errors.saturating_add(1);
                         }
 
-                        /* 2.5 accuracy check - proper ±500ns validation */
-                        // TR 101 290: PCR accuracy should be ±500ns (±14 ticks at 27MHz)
-                        // Strategy: Establish baseline bitrate from first samples, then validate
-                        // that subsequent PCRs match the expected timeline within tolerance
+                        /* 2.5 accuracy check - wall-clock time comparison */
+                        // Compare PCR progression against real elapsed time.
+                        // For a real-time stream, PCR should advance at ~27MHz relative
+                        // to wall-clock time. Deviation indicates encoder clock drift.
+                        let wall_elapsed = prev_info.last_wall_time.elapsed();
+                        let wall_elapsed_ns = wall_elapsed.as_nanos() as i64;
 
-                        let bytes_transmitted = packet_ctx.total_bytes_processed - prev_info.last_byte_pos;
+                        // Only check if reasonable interval (10ms-500ms) to avoid noise
+                        if wall_elapsed_ns >= 10_000_000 && wall_elapsed_ns <= 500_000_000 {
+                            // Expected PCR ticks based on wall-clock elapsed time
+                            // 27MHz = 27 ticks per microsecond = 0.027 ticks per nanosecond
+                            let expected_ticks = (wall_elapsed_ns as f64 * 0.027) as i64;
+                            let actual_ticks = ticks_delta as i64;
+                            let deviation = (actual_ticks - expected_ticks).abs();
 
-                        // Only check accuracy if we have transmitted enough bytes (at least 1KB)
-                        // and the time delta is reasonable (10-100ms)
-                        if bytes_transmitted >= 1000 && pcr_time_delta_ms >= 10 && pcr_time_delta_ms <= 100 {
-                            // Calculate instantaneous bitrate from this PCR pair
-                            let bits_transmitted = bytes_transmitted * 8;
-                            let seconds_elapsed = ticks_delta as f64 / PCR_CLOCK_HZ;
-                            let measured_bitrate = bits_transmitted as f64 / seconds_elapsed;
-
-                            // Store bitrate sample (keep last 10 samples for median calculation)
-                            prev_info.bitrate_samples.push(measured_bitrate);
-                            if prev_info.bitrate_samples.len() > 10 {
-                                prev_info.bitrate_samples.remove(0);
-                            }
-
-                            // Once we have enough samples (≥3), validate PCR accuracy
-                            if prev_info.bitrate_samples.len() >= 3 {
-                                // Calculate median bitrate to avoid outliers
-                                let mut sorted_bitrates = prev_info.bitrate_samples.clone();
-                                sorted_bitrates.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                                let median_bitrate = sorted_bitrates[sorted_bitrates.len() / 2];
-
-                                // Calculate expected PCR increment based on median bitrate
-                                // expected_ticks = (bytes * 8) / bitrate * PCR_CLOCK_HZ
-                                let expected_ticks = (bytes_transmitted as f64 * 8.0 / median_bitrate * PCR_CLOCK_HZ) as i64;
-                                let actual_ticks = ticks_delta as i64;
-
-                                // Check if deviation exceeds ±500ns tolerance (±14 ticks)
-                                let deviation = (actual_ticks - expected_ticks).abs();
-                                if deviation > PCR_ACCURACY_TICKS {
-                                    self.pcr_accuracy_errors = self.pcr_accuracy_errors.saturating_add(1);
-                                }
+                            if deviation > PCR_ACCURACY_TICKS {
+                                self.pcr_accuracy_errors = self.pcr_accuracy_errors.saturating_add(1);
                             }
                         }
 
                         prev_info.last_pcr_ticks = pcr_ticks;
-                        prev_info.last_byte_pos = packet_ctx.total_bytes_processed;
+                        prev_info.last_wall_time = now;
                     }
                 }
             }
@@ -624,26 +636,35 @@ impl Tr101Metrics {
         }
 
         /* ───── NIT/SDT/EIT/TDT timeouts - Priority 3 ───── */
+        /* Use state-transition counting (only increment on entering timeout)
+         * and startup grace period to avoid false positives. */
         if matches!(packet_ctx.priority_level, crate::types::AnalysisMode::Tr101) {
-            if self.last_nit_seen.is_none_or(|t| t.elapsed()
-                    > Duration::from_millis(NIT_TIMEOUT_MS)) {
-                self.nit_timeout += 1;
-                self.last_nit_seen = Some(now);
-            }
-            if self.last_sdt_seen.is_none_or(|t| t.elapsed()
-                    > Duration::from_millis(SDT_TIMEOUT_MS)) {
-                self.sdt_timeout += 1;
-                self.last_sdt_seen = Some(now);
-            }
-            if self.last_eit_seen.is_none_or(|t| t.elapsed()
-                    > Duration::from_millis(EIT_TIMEOUT_MS)) {
-                self.eit_timeout += 1;
-                self.last_eit_seen = Some(now);
-            }
-            if self.last_tdt_seen.is_none_or(|t| t.elapsed()
-                    > Duration::from_millis(TDT_TIMEOUT_MS)) {
-                self.tdt_timeout += 1;
-                self.last_tdt_seen = Some(now);
+            if let Some(start_time) = self.startup_time {
+                if start_time.elapsed() > Duration::from_millis(3000) {
+                    // NIT timeout
+                    let was = self.nit_timeout_state;
+                    let is = self.last_nit_seen.is_none_or(|t| t.elapsed() > Duration::from_millis(NIT_TIMEOUT_MS));
+                    if is && !was { self.nit_timeout += 1; }
+                    self.nit_timeout_state = is;
+
+                    // SDT timeout
+                    let was = self.sdt_timeout_state;
+                    let is = self.last_sdt_seen.is_none_or(|t| t.elapsed() > Duration::from_millis(SDT_TIMEOUT_MS));
+                    if is && !was { self.sdt_timeout += 1; }
+                    self.sdt_timeout_state = is;
+
+                    // EIT timeout
+                    let was = self.eit_timeout_state;
+                    let is = self.last_eit_seen.is_none_or(|t| t.elapsed() > Duration::from_millis(EIT_TIMEOUT_MS));
+                    if is && !was { self.eit_timeout += 1; }
+                    self.eit_timeout_state = is;
+
+                    // TDT timeout
+                    let was = self.tdt_timeout_state;
+                    let is = self.last_tdt_seen.is_none_or(|t| t.elapsed() > Duration::from_millis(TDT_TIMEOUT_MS));
+                    if is && !was { self.tdt_timeout += 1; }
+                    self.tdt_timeout_state = is;
+                }
             }
         }
     }
