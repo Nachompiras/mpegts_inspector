@@ -29,6 +29,8 @@ struct EsJson<'a> {
 #[derive(Serialize)]
 struct ProgramJson<'a> {
     program: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_name: Option<&'a str>,
     streams: Vec<EsJson<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pcr_pid: Option<u16>,
@@ -79,9 +81,11 @@ impl Reporter {
                     // Get PCR PID and PMT version for this program
                     let pcr_pid = processor.get_pcr_pid(*prog_num);
                     let pmt_version = processor.get_pmt_version(pmt_pid);
+                    let service_name = processor.si_cache.get_service_name(*prog_num).map(String::from);
 
                     programs.push(ProgramInfo {
                         program_number: *prog_num,
+                        service_name,
                         streams,
                         pcr_pid,
                         pmt_version,
@@ -170,9 +174,11 @@ impl Reporter {
                     // Get PCR PID and PMT version for this program
                     let pcr_pid = processor.get_pcr_pid(*prog_num);
                     let pmt_version = processor.get_pmt_version(pmt_pid);
+                    let service_name = processor.si_cache.get_service_name(*prog_num);
 
                     programs_out.push(ProgramJson {
                         program: *prog_num,
+                        service_name,
                         streams: es_vec,
                         pcr_pid,
                         pmt_version,

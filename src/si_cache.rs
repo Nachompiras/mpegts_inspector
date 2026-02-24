@@ -15,6 +15,16 @@ impl SiCache {
     pub fn update_sdt(&mut self, sdt: SdtSection) { self.sdt = Some(sdt); }
     pub fn update_nit(&mut self, nit: NitSection) { self.nit = Some(nit); }
 
+    /// Look up service name from the cached SDT by program number (service_id).
+    pub fn get_service_name(&self, program_number: u16) -> Option<&str> {
+        self.sdt.as_ref().and_then(|sdt| {
+            sdt.services
+                .iter()
+                .find(|s| s.service_id == program_number)
+                .and_then(|s| s.service_name.as_deref())
+        })
+    }
+
     /// 3.2-d Service_ID mismatch between SDT and PMT list
     pub fn check_service_id_mismatch(&self) -> bool {
         let sdt = match &self.sdt { Some(s) => s, None => return false };

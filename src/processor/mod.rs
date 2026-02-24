@@ -5,7 +5,7 @@ use crate::types::{CodecInfo, SubtitleInfo, AnalysisMode, SiTableContext, Packet
 use crate::constants::*;
 use crate::stats::StatsManager;
 use crate::parsers::{parse_video_codec, parse_audio_codec};
-use crate::psi::{parse_pat, parse_pmt, parse_cat, parse_nit, parse_sdt, parse_eit_pf, parse_tdt_tot, PatSection, PmtSection};
+use crate::psi::{parse_pat, parse_pmt, parse_cat, parse_nit, parse_sdt, parse_eit_pf, parse_tdt_tot, PatSection, PmtSection, SectionAssembler};
 use crate::si_cache::SiCache;
 use crate::tr101::Tr101Metrics;
 
@@ -19,6 +19,7 @@ pub struct PacketProcessor {
     pub si_cache: SiCache,
     pub tr101: Option<Tr101Metrics>,
     pub total_bytes_processed: u64, // Total bytes processed for PCR accuracy calculation
+    psi_assemblers: HashMap<u16, SectionAssembler>,
 }
 
 impl PacketProcessor {
@@ -33,6 +34,7 @@ impl PacketProcessor {
             si_cache: SiCache::default(),
             tr101: if enable_tr101 { Some(Tr101Metrics::new()) } else { None },
             total_bytes_processed: 0,
+            psi_assemblers: HashMap::new(),
         }
     }
 
@@ -195,71 +197,129 @@ impl PacketProcessor {
         context: &mut SiTableContext,
         analysis_mode: Option<AnalysisMode>,
     ) {
-        // PAT (PID 0x0000)
-        if pid == 0x0000 && payload_unit_start {
-            match parse_pat(payload) {
-                Ok(pat) => {
-                    context.pat_crc_ok = Some(true);
+        // Determine if this PID carries a SI/PSI table that needs assembly
+        let is_psi_pid = matches!(pid, 0x0000 | 0x0001 | 0x0010 | 0x0011 | 0x0014)
+            || self.pat_map.values().any(|p| p.programs.iter().any(|e| e.pmt_pid == pid));
 
-                    // Check for PAT version changes (Priority 2)
-                    if let Some(ref mut tr101) = self.tr101 {
+        if !is_psi_pid {
+            return;
+        }
+
+        let assembler = self.psi_assemblers
+            .entry(pid)
+            .or_insert_with(SectionAssembler::new);
+
+        let sections = assembler.push(payload, payload_unit_start);
+
+        for section_buf in sections {
+            self.dispatch_section(pid, &section_buf, context, analysis_mode);
+        }
+    }
+
+    fn dispatch_section(
+        &mut self,
+        pid: u16,
+        parse_buf: &[u8],
+        context: &mut SiTableContext,
+        analysis_mode: Option<AnalysisMode>,
+    ) {
+        match pid {
+            // PAT (PID 0x0000)
+            0x0000 => {
+                match parse_pat(parse_buf) {
+                    Ok(pat) => {
+                        context.pat_crc_ok = Some(true);
+
+                        if let Some(ref mut tr101) = self.tr101 {
+                            for entry in &pat.programs {
+                                tr101.check_pat_version_change(entry.program_number, pat.version, analysis_mode.unwrap_or(AnalysisMode::None));
+                            }
+                        }
+
+                        self.si_cache.update_pat(pat.clone());
                         for entry in &pat.programs {
-                            tr101.check_pat_version_change(entry.program_number, pat.version, analysis_mode.unwrap_or(AnalysisMode::None));
+                            self.pat_map.insert(entry.program_number, pat.clone());
                         }
                     }
+                    Err(_) => { context.pat_crc_ok = Some(false); }
+                }
+            }
 
-                    // Store PAT efficiently - avoid multiple clones
-                    self.si_cache.update_pat(pat.clone());
-                    for entry in &pat.programs {
-                        self.pat_map.insert(entry.program_number, pat.clone());
+            // CAT (PID 0x0001)
+            0x0001 => {
+                match parse_cat(parse_buf) {
+                    Ok((_table_id, _cat)) => {
+                        context.cat_crc_ok = Some(true);
+                        context.table_id = _table_id;
+                    }
+                    Err(_) => { context.cat_crc_ok = Some(false); }
+                }
+            }
+
+            // NIT (PID 0x0010)
+            0x0010 => {
+                match parse_nit(parse_buf) {
+                    Ok((tid, nit)) => {
+                        context.nit_crc_ok = Some(true);
+                        context.table_id = tid;
+                        self.si_cache.update_nit(nit);
+                    }
+                    Err(_) => {
+                        context.nit_crc_ok = Some(false);
                     }
                 }
-                Err(_) => { context.pat_crc_ok = Some(false); }
             }
-        }
 
-        // CAT (PID 0x0001)
-        if pid == 0x0001 && payload_unit_start {
-            match parse_cat(payload) {
-                Ok((_table_id, _cat)) => {
-                    context.cat_crc_ok = Some(true);
-                    context.table_id = _table_id;
+            // SDT/EIT (PID 0x0011)
+            0x0011 => {
+                let mut handled = false;
+                if context.sdt_crc_ok.is_none() {
+                    if let Ok((tid, sdt)) = parse_sdt(parse_buf) {
+                        context.sdt_crc_ok = Some(true);
+                        context.table_id = tid;
+                        self.si_cache.update_sdt(sdt);
+                        handled = true;
+                    }
                 }
-                Err(_) => { context.cat_crc_ok = Some(false); }
-            }
-        }
 
-        // NIT (PID 0x0010)
-        if pid == 0x0010 && payload_unit_start {
-            match parse_nit(payload) {
-                Ok((tid, nit)) => {
-                    context.nit_crc_ok = Some(true);
-                    context.table_id = tid;
-                    self.si_cache.update_nit(nit);
-                }
-                Err(_) => {
-                    context.nit_crc_ok = Some(false);
+                if !handled {
+                    match parse_eit_pf(parse_buf) {
+                        Ok((tid, _eit)) => {
+                            context.eit_crc_ok = Some(true);
+                            context.table_id = tid;
+                        }
+                        Err(_) => { /* may be TOT/TDT or CRC error -> ignore */ }
+                    }
                 }
             }
-        }
 
-        // PMT
-        if let Some((_prog_num, _pat)) =
-            self.pat_map.iter().find(|(_, p)| p.programs.iter().any(|e| e.pmt_pid == pid))
-        {
-            if payload_unit_start {
-                match parse_pmt(payload) {
+            // TDT/TOT (PID 0x0014)
+            0x0014 => {
+                match parse_tdt_tot(parse_buf) {
+                    Ok((tid, _tdt_tot)) => {
+                        context.table_id = tid;
+                        if tid == 0x73 {
+                            context.tdt_crc_ok = Some(true);
+                        }
+                    }
+                    Err(_) => {
+                        context.tdt_crc_ok = Some(false);
+                    }
+                }
+            }
+
+            // PMT (any PID referenced by PAT)
+            _ => {
+                match parse_pmt(parse_buf) {
                     Ok(pmt) => {
                         context.pmt_crc_ok = Some(true);
 
-                        // Check for PMT version changes (Priority 2)
                         if let Some(ref mut tr101) = self.tr101 {
                             tr101.check_pmt_version_change(pid, pmt.version, analysis_mode.unwrap_or(AnalysisMode::None));
 
-                            // Register all PIDs in this PMT as known/authorized
-                            tr101.register_known_pid(pmt.pcr_pid); // Register PCR PID
+                            tr101.register_known_pid(pmt.pcr_pid);
                             for stream in &pmt.streams {
-                                tr101.register_known_pid(stream.elementary_pid); // Register elementary stream PIDs
+                                tr101.register_known_pid(stream.elementary_pid);
                             }
                         }
 
@@ -271,52 +331,9 @@ impl PacketProcessor {
                         }
 
                         self.si_cache.update_pmt(pid, pmt.clone());
-                        self.pmt_map.insert(pid, pmt.clone());
+                        self.pmt_map.insert(pid, pmt);
                     }
                     Err(_) => { context.pmt_crc_ok = Some(false); }
-                }
-            }
-        }
-
-        // SDT/EIT (PID 0x0011)
-        if pid == 0x0011 && payload_unit_start {
-            let mut handled = false;
-            if context.sdt_crc_ok.is_none() {
-                if let Ok((tid, sdt)) = parse_sdt(payload) {
-                    context.sdt_crc_ok = Some(true);
-                    context.table_id = tid;
-                    self.si_cache.update_sdt(sdt);
-                    handled = true;
-                }
-            }
-
-            if !handled {
-                match parse_eit_pf(payload) {
-                    Ok((tid, _eit)) => {
-                        context.eit_crc_ok = Some(true);
-                        context.table_id = tid;
-                    }
-                    Err(_) => { /* may be TOT/TDT or CRC error → ignore */ }
-                }
-            }
-        }
-
-        // TDT/TOT (PID 0x0014)
-        if pid == 0x0014 && payload_unit_start {
-            match parse_tdt_tot(payload) {
-                Ok((tid, _tdt_tot)) => {
-                    context.table_id = tid;
-                    // TDT (0x70) has no CRC, TOT (0x73) has CRC
-                    if tid == 0x73 {
-                        context.tdt_crc_ok = Some(true);  // TOT CRC was validated successfully
-                    }
-                    // For TDT, we don't set tdt_crc_ok since it has no CRC
-                }
-                Err(_) => {
-                    // If it's a TOT (should have CRC), mark as CRC error
-                    // We can't easily determine if it was supposed to be TOT vs TDT here,
-                    // so we conservatively assume CRC error only if parse failed
-                    context.tdt_crc_ok = Some(false);
                 }
             }
         }

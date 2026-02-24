@@ -84,6 +84,8 @@ pub struct StreamInfo {
 #[derive(Debug, Clone, Serialize)]
 pub struct ProgramInfo {
     pub program_number: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_name: Option<String>,
     pub streams: Vec<StreamInfo>,
     /// PCR PID for this program (from PMT)
     #[serde(skip_serializing_if = "Option::is_none")]
