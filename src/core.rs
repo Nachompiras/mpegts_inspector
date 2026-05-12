@@ -85,6 +85,50 @@ where
     }
 }
 
+/// `mpsc::Receiver<Bytes>`-based inspection with structured data callback.
+///
+/// Mirrors [`run_broadcast`] but consumes from a bounded mpsc channel of `Bytes`.
+/// Zero-copy: the payload is borrowed as `&[u8]` directly, no `Vec<u8>` allocation
+/// or `to_vec()` per packet.
+///
+/// Returns `Ok(())` if the sender side is dropped (clean shutdown).
+pub async fn run_mpsc_bytes<F>(
+    rx: &mut tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    refresh_secs: u64,
+    analysis: bool,
+    callback: &mut F,
+) -> anyhow::Result<()>
+where
+    F: FnMut(InspectorReport) + Send,
+{
+    let analysis_mode = if analysis { Some(AnalysisMode::Tr101Priority12) } else { Some(AnalysisMode::Mux) };
+    let mut processor = PacketProcessor::new(analysis);
+    let mut last_print = Instant::now();
+
+    while let Some(buf) = rx.recv().await {
+        for chunk in buf.chunks_exact(188) {
+            if chunk[0] != 0x47 {
+                continue;
+            }
+            processor.process_packet(chunk, analysis_mode);
+        }
+
+        if last_print.elapsed() >= Duration::from_secs(refresh_secs) {
+            processor.cleanup_old_streams(30);
+
+            let report = Reporter::create_report(
+                &processor,
+                processor.get_tr101_metrics(),
+                analysis_mode,
+            );
+            callback(report);
+            last_print = Instant::now();
+        }
+    }
+
+    Ok(())
+}
+
 /// Advanced broadcast inspection with runtime analysis control
 pub async fn run_broadcast_with_control(
     rx: &mut tokio::sync::broadcast::Receiver<Vec<u8>>,

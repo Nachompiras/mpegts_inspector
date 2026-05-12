@@ -43,6 +43,27 @@ pub mod inspector {
         crate::core::run_broadcast(&mut rx, refresh_secs, analysis, &mut callback).await
     }
 
+    /// Entry-point that reads TS packets from an `mpsc::Receiver<Bytes>` and provides
+    /// structured data via callback.
+    ///
+    /// Preferred over [`run_from_broadcast`] when:
+    /// - the producer can apply per-subscriber backpressure (e.g. a fan-out with bounded mpsc).
+    /// - zero-copy ingestion is desired: `Bytes` is treated as `&[u8]` directly
+    ///   (no `Vec<u8>` allocation per packet, no `to_vec()`).
+    /// - silent drops on a saturated broadcast ring are unacceptable (this path
+    ///   exposes backpressure to the caller via the bounded mpsc).
+    pub async fn run_from_mpsc_bytes<F>(
+        mut rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+        refresh_secs: u64,
+        analysis: bool,
+        mut callback: F,
+    ) -> anyhow::Result<()>
+    where
+        F: FnMut(InspectorReport) + Send,
+    {
+        crate::core::run_mpsc_bytes(&mut rx, refresh_secs, analysis, &mut callback).await
+    }
+
     /// Advanced broadcast entry-point with runtime analysis control
     pub async fn run_from_broadcast_with_control(
         mut rx: tokio::sync::broadcast::Receiver<Vec<u8>>,
